@@ -2,6 +2,7 @@ mod claude;
 mod config;
 mod db;
 mod error;
+mod llm;
 mod mcp;
 mod memory;
 mod scheduler;
@@ -47,13 +48,19 @@ SETUP:
     2. Fill in the required values:
 
        TELEGRAM_BOT_TOKEN   Bot token from @BotFather
-       ANTHROPIC_API_KEY    API key from console.anthropic.com
+       LLM_API_KEY          API key (also accepts ANTHROPIC_API_KEY)
        BOT_USERNAME         Your bot's username (without @)
 
     3. Run: microclaw start
 
+LLM PROVIDER ENV VARS:
+    LLM_PROVIDER             Provider: "anthropic" or "openai" (default: anthropic)
+    LLM_API_KEY              API key (falls back to ANTHROPIC_API_KEY)
+    LLM_MODEL                Model name (falls back to CLAUDE_MODEL)
+    LLM_BASE_URL             Custom base URL for the provider (optional)
+                             Supports OpenRouter, DeepSeek, Groq, Ollama, etc.
+
 OPTIONAL ENV VARS:
-    CLAUDE_MODEL             Model to use (default: claude-sonnet-4-20250514)
     DATA_DIR                 Data directory (default: ./data)
     MAX_TOKENS               Max tokens per response (default: 8192)
     MAX_TOOL_ITERATIONS      Max tool loop iterations (default: 25)

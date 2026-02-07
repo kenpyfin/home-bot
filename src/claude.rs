@@ -1,8 +1,4 @@
 use serde::{Deserialize, Serialize};
-use tracing::warn;
-
-use crate::config::Config;
-use crate::error::MicroClawError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -90,102 +86,6 @@ pub enum ResponseContentBlock {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiError {
-    error: ApiErrorDetail,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiErrorDetail {
-    message: String,
-    #[serde(rename = "type")]
-    error_type: String,
-}
-
-pub struct ClaudeClient {
-    http: reqwest::Client,
-    api_key: String,
-    model: String,
-    max_tokens: u32,
-}
-
-impl ClaudeClient {
-    pub fn new(config: &Config) -> Self {
-        ClaudeClient {
-            http: reqwest::Client::new(),
-            api_key: config.anthropic_api_key.clone(),
-            model: config.claude_model.clone(),
-            max_tokens: config.max_tokens,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn model(&self) -> &str {
-        &self.model
-    }
-
-    pub async fn send_message(
-        &self,
-        system: &str,
-        messages: Vec<Message>,
-        tools: Option<Vec<ToolDefinition>>,
-    ) -> Result<MessagesResponse, MicroClawError> {
-        let request = MessagesRequest {
-            model: self.model.clone(),
-            max_tokens: self.max_tokens,
-            system: system.to_string(),
-            messages,
-            tools,
-        };
-
-        let mut retries = 0;
-        let max_retries = 3;
-
-        loop {
-            let response = self
-                .http
-                .post("https://api.anthropic.com/v1/messages")
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&request)
-                .send()
-                .await?;
-
-            let status = response.status();
-
-            if status.is_success() {
-                let body = response.text().await?;
-                let parsed: MessagesResponse = serde_json::from_str(&body).map_err(|e| {
-                    MicroClawError::AnthropicApi(format!(
-                        "Failed to parse response: {e}\nBody: {body}"
-                    ))
-                })?;
-                return Ok(parsed);
-            }
-
-            if status.as_u16() == 429 && retries < max_retries {
-                retries += 1;
-                let delay = std::time::Duration::from_secs(2u64.pow(retries));
-                warn!("Rate limited, retrying in {:?} (attempt {retries}/{max_retries})", delay);
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-
-            let body = response.text().await.unwrap_or_default();
-            if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
-                return Err(MicroClawError::AnthropicApi(format!(
-                    "{}: {}",
-                    api_err.error.error_type, api_err.error.message
-                )));
-            }
-            return Err(MicroClawError::AnthropicApi(format!(
-                "HTTP {status}: {body}"
-            )));
-        }
-    }
 }
 
 #[cfg(test)]
@@ -342,32 +242,6 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         assert!(json["tools"].is_array());
         assert_eq!(json["tools"][0]["name"], "bash");
-    }
-
-    #[test]
-    fn test_claude_client_new() {
-        let config = crate::config::Config {
-            telegram_bot_token: "tok".into(),
-            anthropic_api_key: "key123".into(),
-            bot_username: "bot".into(),
-            claude_model: "claude-test".into(),
-            data_dir: "/tmp".into(),
-            max_tokens: 2048,
-            max_tool_iterations: 10,
-            max_history_messages: 20,
-            openai_api_key: None,
-            timezone: "UTC".into(),
-            allowed_groups: vec![],
-            max_session_messages: 40,
-            compact_keep_recent: 20,
-            whatsapp_access_token: None,
-            whatsapp_phone_number_id: None,
-            whatsapp_verify_token: None,
-            whatsapp_webhook_port: 8080,
-        };
-        let client = ClaudeClient::new(&config);
-        assert_eq!(client.model(), "claude-test");
-        assert_eq!(client.max_tokens, 2048);
     }
 
     #[test]

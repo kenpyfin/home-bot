@@ -5,8 +5,9 @@ use teloxide::types::ChatAction;
 use tracing::{error, info};
 
 use crate::claude::{
-    ClaudeClient, ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock,
+    ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock,
 };
+use crate::llm::LlmProvider;
 use crate::config::Config;
 use crate::db::{Database, StoredMessage};
 use crate::memory::MemoryManager;
@@ -19,7 +20,7 @@ pub(crate) struct AppState {
     pub db: Arc<Database>,
     pub memory: MemoryManager,
     pub skills: SkillManager,
-    pub claude: ClaudeClient,
+    pub llm: Box<dyn LlmProvider>,
     pub tools: ToolRegistry,
 }
 
@@ -33,7 +34,7 @@ pub async fn run_bot(
     let bot = Bot::new(&config.telegram_bot_token);
     let db = Arc::new(db);
 
-    let claude = ClaudeClient::new(&config);
+    let llm = crate::llm::create_provider(&config);
     let mut tools = ToolRegistry::new(&config, bot.clone(), db.clone());
 
     // Register MCP tools
@@ -47,7 +48,7 @@ pub async fn run_bot(
         db,
         memory,
         skills,
-        claude,
+        llm,
         tools,
     });
 
@@ -417,7 +418,7 @@ pub(crate) async fn process_with_claude(
     // Compact if messages exceed threshold
     if messages.len() > state.config.max_session_messages {
         messages = compact_messages(
-            &state.claude,
+            state.llm.as_ref(),
             &messages,
             state.config.compact_keep_recent,
         )
@@ -429,7 +430,7 @@ pub(crate) async fn process_with_claude(
     // Agentic tool-use loop
     for iteration in 0..state.config.max_tool_iterations {
         let response = state
-            .claude
+            .llm
             .send_message(&system_prompt, messages.clone(), Some(tool_defs.clone()))
             .await?;
 
@@ -770,7 +771,7 @@ fn strip_images_for_session(messages: &mut [Message]) {
 
 /// Compact old messages by summarizing them via Claude, keeping recent messages verbatim.
 async fn compact_messages(
-    claude: &ClaudeClient,
+    llm: &dyn LlmProvider,
     messages: &[Message],
     keep_recent: usize,
 ) -> Vec<Message> {
@@ -806,7 +807,7 @@ async fn compact_messages(
         )),
     }];
 
-    let summary = match claude
+    let summary = match llm
         .send_message("You are a helpful summarizer.", summarize_messages, None)
         .await
     {

@@ -4,7 +4,7 @@ use tracing::info;
 
 use super::{schema_object, Tool, ToolRegistry, ToolResult};
 use crate::claude::{
-    ClaudeClient, ContentBlock, Message, MessageContent, ResponseContentBlock, ToolDefinition,
+    ContentBlock, Message, MessageContent, ResponseContentBlock, ToolDefinition,
 };
 use crate::config::Config;
 
@@ -61,7 +61,7 @@ impl Tool for SubAgentTool {
 
         info!("Sub-agent starting task: {}", task);
 
-        let claude = ClaudeClient::new(&self.config);
+        let llm = crate::llm::create_provider(&self.config);
         let tools = ToolRegistry::new_sub_agent(&self.config);
         let tool_defs = tools.definitions();
 
@@ -81,7 +81,7 @@ impl Tool for SubAgentTool {
         }];
 
         for iteration in 0..MAX_SUB_AGENT_ITERATIONS {
-            let response = match claude
+            let response = match llm
                 .send_message(&system_prompt, messages.clone(), Some(tool_defs.clone()))
                 .await
             {
@@ -189,13 +189,15 @@ mod tests {
     fn test_config() -> Config {
         Config {
             telegram_bot_token: "tok".into(),
-            anthropic_api_key: "key".into(),
             bot_username: "bot".into(),
-            claude_model: "claude-test".into(),
-            data_dir: "/tmp".into(),
+            llm_provider: "anthropic".into(),
+            api_key: "key".into(),
+            model: "claude-test".into(),
+            llm_base_url: None,
             max_tokens: 4096,
             max_tool_iterations: 25,
             max_history_messages: 50,
+            data_dir: "/tmp".into(),
             openai_api_key: None,
             timezone: "UTC".into(),
             allowed_groups: vec![],
