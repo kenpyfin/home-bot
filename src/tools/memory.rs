@@ -28,7 +28,7 @@ impl Tool for ReadMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_memory".into(),
-            description: "Read the CLAUDE.md memory file. Use scope 'global' for memories shared across all chats, or 'chat' for chat-specific memories.".into(),
+            description: "Read the AGENTS.md memory file. Use scope 'global' for memories shared across all chats, or 'chat' for chat-specific memories.".into(),
             input_schema: schema_object(
                 json!({
                     "scope": {
@@ -53,7 +53,7 @@ impl Tool for ReadMemoryTool {
         };
 
         let path = match scope {
-            "global" => self.groups_dir.join("CLAUDE.md"),
+            "global" => self.groups_dir.join("AGENTS.md"),
             "chat" => {
                 let chat_id = match input.get("chat_id").and_then(|v| v.as_i64()) {
                     Some(id) => id,
@@ -62,7 +62,7 @@ impl Tool for ReadMemoryTool {
                 if let Err(e) = authorize_chat_access(&input, chat_id) {
                     return ToolResult::error(e);
                 }
-                self.groups_dir.join(chat_id.to_string()).join("CLAUDE.md")
+                self.groups_dir.join(chat_id.to_string()).join("AGENTS.md")
             }
             _ => return ToolResult::error("scope must be 'global' or 'chat'".into()),
         };
@@ -103,7 +103,7 @@ impl Tool for WriteMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_memory".into(),
-            description: "Write to the CLAUDE.md memory file. Use this to remember important information about the user or conversation. Use scope 'global' for memories shared across all chats, or 'chat' for chat-specific memories.".into(),
+            description: "Write to the AGENTS.md memory file. Use this to remember important information about the user or conversation. Use scope 'global' for memories shared across all chats, or 'chat' for chat-specific memories.".into(),
             input_schema: schema_object(
                 json!({
                     "scope": {
@@ -145,7 +145,7 @@ impl Tool for WriteMemoryTool {
                         ));
                     }
                 }
-                self.groups_dir.join("CLAUDE.md")
+                self.groups_dir.join("AGENTS.md")
             }
             "chat" => {
                 let chat_id = match input.get("chat_id").and_then(|v| v.as_i64()) {
@@ -155,7 +155,7 @@ impl Tool for WriteMemoryTool {
                 if let Err(e) = authorize_chat_access(&input, chat_id) {
                     return ToolResult::error(e);
                 }
-                self.groups_dir.join(chat_id.to_string()).join("CLAUDE.md")
+                self.groups_dir.join(chat_id.to_string()).join("AGENTS.md")
             }
             _ => return ToolResult::error("scope must be 'global' or 'chat'".into()),
         };
@@ -314,7 +314,7 @@ mod tests {
             }))
             .await;
         assert!(!result.is_error, "{}", result.content);
-        let content = std::fs::read_to_string(dir.join("groups").join("CLAUDE.md")).unwrap();
+        let content = std::fs::read_to_string(dir.join("groups").join("AGENTS.md")).unwrap();
         assert_eq!(content, "global ok");
         let _ = std::fs::remove_dir_all(&dir);
     }

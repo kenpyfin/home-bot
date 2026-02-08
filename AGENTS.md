@@ -31,7 +31,7 @@ src/
     db.rs            -- SQLite database. Four tables: chats, messages, scheduled_tasks,
                         sessions. Uses Mutex<Connection> for thread safety. Shared as
                         Arc<Database>.
-    memory.rs        -- MemoryManager. Reads/writes CLAUDE.md files at global and per-chat
+    memory.rs        -- MemoryManager. Reads/writes AGENTS.md files at global and per-chat
                         scopes. Builds memory context injected into system prompts.
     scheduler.rs     -- Background scheduler. Spawns a tokio task that polls every 60s
                         for due tasks, executes the agent loop, sends results to chat.
@@ -46,7 +46,7 @@ src/
         edit_file.rs -- Find/replace editing. Validates old_string is unique.
         glob.rs      -- File pattern matching via the glob crate.
         grep.rs      -- Recursive regex search with directory traversal.
-        memory.rs    -- read_memory / write_memory tools for CLAUDE.md persistence.
+        memory.rs    -- read_memory / write_memory tools for AGENTS.md persistence.
         web_search.rs-- DuckDuckGo HTML search. GET html.duckduckgo.com/html/?q=...,
                         regex parse result__a (links) and result__snippet (descriptions).
         web_fetch.rs -- Fetch URL, strip HTML tags via regex, return plain text (max 20KB).
@@ -129,8 +129,8 @@ Constructor signatures:
 ### Memory system (`memory.rs`)
 
 Two scopes:
-- **Global:** `data/groups/CLAUDE.md` -- shared across all chats
-- **Per-chat:** `data/groups/{chat_id}/CLAUDE.md` -- specific to one conversation
+- **Global:** `data/groups/AGENTS.md` -- shared across all chats
+- **Per-chat:** `data/groups/{chat_id}/AGENTS.md` -- specific to one conversation
 
 Memory content is injected into the system prompt wrapped in `<global_memory>` / `<chat_memory>` XML tags. Claude reads/writes memory via the `read_memory` and `write_memory` tools.
 

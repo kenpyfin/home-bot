@@ -15,7 +15,7 @@ Rust 2021, Tokio, teloxide 0.17, serenity 0.12, Anthropic Messages API (direct H
 - `src/discord.rs` -- Discord bot (serenity gateway, reuses process_with_claude)
 - `src/claude.rs` -- Anthropic API client, request/response types
 - `src/db.rs` -- SQLite: chats, messages, scheduled_tasks, sessions tables
-- `src/memory.rs` -- CLAUDE.md memory system (global + per-chat)
+- `src/memory.rs` -- AGENTS.md memory system (global + per-chat)
 - `src/scheduler.rs` -- background task scheduler (60s polling)
 - `src/tools/mod.rs` -- Tool trait, ToolRegistry (17 tools), ToolRegistry::new_sub_agent (9 restricted tools)
 - `src/tools/path_guard.rs` -- sensitive path blacklisting for file tools

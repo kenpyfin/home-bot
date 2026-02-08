@@ -12,11 +12,11 @@ impl MemoryManager {
     }
 
     fn global_memory_path(&self) -> PathBuf {
-        self.data_dir.join("CLAUDE.md")
+        self.data_dir.join("AGENTS.md")
     }
 
     fn chat_memory_path(&self, chat_id: i64) -> PathBuf {
-        self.data_dir.join(chat_id.to_string()).join("CLAUDE.md")
+        self.data_dir.join(chat_id.to_string()).join("AGENTS.md")
     }
 
     pub fn read_global_memory(&self) -> Option<String> {
@@ -93,7 +93,7 @@ mod tests {
     fn test_global_memory_path() {
         let (mm, dir) = test_memory_manager();
         let path = mm.global_memory_path();
-        assert!(path.ends_with("groups/CLAUDE.md"));
+        assert!(path.ends_with("groups/AGENTS.md"));
         cleanup(&dir);
     }
 
@@ -101,7 +101,7 @@ mod tests {
     fn test_chat_memory_path() {
         let (mm, dir) = test_memory_manager();
         let path = mm.chat_memory_path(12345);
-        assert!(path.to_str().unwrap().contains("groups/12345/CLAUDE.md"));
+        assert!(path.to_str().unwrap().contains("groups/12345/AGENTS.md"));
         cleanup(&dir);
     }
 

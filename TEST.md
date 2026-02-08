@@ -182,11 +182,11 @@ Since MicroClaw is a multi-platform bot with external dependencies (LLM APIs, Te
 
 | # | User Story | Steps | Expected |
 |---|-----------|-------|----------|
-| 12.1 | Write chat memory | "Remember I like Rust" | Written to `<data_dir>/groups/{chat_id}/CLAUDE.md` |
+| 12.1 | Write chat memory | "Remember I like Rust" | Written to `<data_dir>/groups/{chat_id}/AGENTS.md` |
 | 12.2 | Read chat memory | "What language do I like?" | Bot recalls "Rust" from memory |
 | 12.3 | Memory persists across /reset | `/reset`, then "What do I like?" | Still recalls (memory is independent of session) |
 | 12.4 | Memory persists across restart | Restart bot, then ask | Still recalls (memory is file-persisted) |
-| 12.5 | Write global memory (control) | From control chat, write global memory | Written to `<data_dir>/groups/CLAUDE.md` |
+| 12.5 | Write global memory (control) | From control chat, write global memory | Written to `<data_dir>/groups/AGENTS.md` |
 | 12.6 | Write global memory (regular) | From regular chat, attempt global write | "Permission denied: chat {id} cannot write global memory" |
 | 12.7 | Read empty memory | New chat, first read | "No memory file found (not yet created)." |
 | 12.8 | Memory overwrite | Write twice with different content | Second write completely replaces first |
