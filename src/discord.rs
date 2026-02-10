@@ -124,7 +124,7 @@ impl EventHandler for Handler {
         let typing = msg.channel_id.start_typing(&ctx.http);
 
         // Process with Claude (reuses the same agentic loop as Telegram)
-        match crate::telegram::process_with_claude(
+        match crate::telegram::process_with_agent(
             &self.app_state,
             channel_id,
             &sender_name,

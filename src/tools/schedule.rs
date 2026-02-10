@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use super::{authorize_chat_access, schema_object, Tool, ToolResult};
+use super::{auth_context_from_input, authorize_chat_access, schema_object, Tool, ToolResult};
 use crate::claude::ToolDefinition;
 use crate::db::Database;
 
@@ -19,6 +19,26 @@ fn compute_next_run(cron_expr: &str, tz_name: &str) -> Result<String, String> {
         .next()
         .ok_or_else(|| "No upcoming run found for this cron expression".to_string())?;
     Ok(next.to_rfc3339())
+}
+
+fn enforce_web_chat_scope(
+    db: &Database,
+    input: &serde_json::Value,
+    target_chat_id: i64,
+) -> Result<(), String> {
+    let Some(auth) = auth_context_from_input(input) else {
+        return Ok(());
+    };
+
+    let caller_is_web = matches!(
+        db.get_chat_type(auth.caller_chat_id),
+        Ok(Some(ref t)) if t == "web"
+    );
+    if caller_is_web && auth.caller_chat_id != target_chat_id {
+        return Err("Permission denied: web chats cannot operate on other chats".into());
+    }
+
+    Ok(())
 }
 
 // --- schedule_task ---
@@ -82,6 +102,9 @@ impl Tool for ScheduleTaskTool {
             None => return ToolResult::error("Missing required parameter: chat_id".into()),
         };
         if let Err(e) = authorize_chat_access(&input, chat_id) {
+            return ToolResult::error(e);
+        }
+        if let Err(e) = enforce_web_chat_scope(self.db.as_ref(), &input, chat_id) {
             return ToolResult::error(e);
         }
         let prompt = match input.get("prompt").and_then(|v| v.as_str()) {
@@ -175,6 +198,9 @@ impl Tool for ListTasksTool {
         if let Err(e) = authorize_chat_access(&input, chat_id) {
             return ToolResult::error(e);
         }
+        if let Err(e) = enforce_web_chat_scope(self.db.as_ref(), &input, chat_id) {
+            return ToolResult::error(e);
+        }
 
         match self.db.get_tasks_for_chat(chat_id) {
             Ok(tasks) => {
@@ -242,6 +268,9 @@ impl Tool for PauseTaskTool {
         if let Err(e) = authorize_chat_access(&input, task.chat_id) {
             return ToolResult::error(e);
         }
+        if let Err(e) = enforce_web_chat_scope(self.db.as_ref(), &input, task.chat_id) {
+            return ToolResult::error(e);
+        }
 
         match self.db.update_task_status(task_id, "paused") {
             Ok(true) => ToolResult::success(format!("Task #{task_id} paused.")),
@@ -298,6 +327,9 @@ impl Tool for ResumeTaskTool {
         if let Err(e) = authorize_chat_access(&input, task.chat_id) {
             return ToolResult::error(e);
         }
+        if let Err(e) = enforce_web_chat_scope(self.db.as_ref(), &input, task.chat_id) {
+            return ToolResult::error(e);
+        }
 
         match self.db.update_task_status(task_id, "active") {
             Ok(true) => ToolResult::success(format!("Task #{task_id} resumed.")),
@@ -352,6 +384,9 @@ impl Tool for CancelTaskTool {
             Err(e) => return ToolResult::error(format!("Failed to load task: {e}")),
         };
         if let Err(e) = authorize_chat_access(&input, task.chat_id) {
+            return ToolResult::error(e);
+        }
+        if let Err(e) = enforce_web_chat_scope(self.db.as_ref(), &input, task.chat_id) {
             return ToolResult::error(e);
         }
 
@@ -412,6 +447,9 @@ impl Tool for GetTaskHistoryTool {
             Err(e) => return ToolResult::error(format!("Failed to load task: {e}")),
         };
         if let Err(e) = authorize_chat_access(&input, task.chat_id) {
+            return ToolResult::error(e);
+        }
+        if let Err(e) = enforce_web_chat_scope(self.db.as_ref(), &input, task.chat_id) {
             return ToolResult::error(e);
         }
         let limit = input.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
@@ -755,6 +793,31 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("Permission denied"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_web_caller_schedule_cross_chat_denied_even_for_control_chat() {
+        let (db, dir) = test_db();
+        db.upsert_chat(100, Some("web-main"), "web").unwrap();
+        db.upsert_chat(200, Some("other"), "private").unwrap();
+        let tool = ScheduleTaskTool::new(db, "UTC".into());
+        let result = tool
+            .execute(json!({
+                "chat_id": 200,
+                "prompt": "say hi",
+                "schedule_type": "once",
+                "schedule_value": "2099-12-31T23:59:59+00:00",
+                "__microclaw_auth": {
+                    "caller_chat_id": 100,
+                    "control_chat_ids": [100]
+                }
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result
+            .content
+            .contains("web chats cannot operate on other chats"));
         cleanup(&dir);
     }
 

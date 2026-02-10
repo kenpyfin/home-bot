@@ -47,6 +47,19 @@ fn default_whatsapp_webhook_port() -> u16 {
 fn default_control_chat_ids() -> Vec<i64> {
     Vec::new()
 }
+fn default_web_enabled() -> bool {
+    false
+}
+fn default_web_host() -> String {
+    "127.0.0.1".into()
+}
+fn default_web_port() -> u16 {
+    3900
+}
+fn is_local_web_host(host: &str) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    h == "127.0.0.1" || h == "localhost" || h == "::1"
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -98,6 +111,14 @@ pub struct Config {
     pub discord_allowed_channels: Vec<u64>,
     #[serde(default)]
     pub show_thinking: bool,
+    #[serde(default = "default_web_enabled")]
+    pub web_enabled: bool,
+    #[serde(default = "default_web_host")]
+    pub web_host: String,
+    #[serde(default = "default_web_port")]
+    pub web_port: u16,
+    #[serde(default)]
+    pub web_auth_token: Option<String>,
 }
 
 impl Config {
@@ -122,30 +143,36 @@ impl Config {
             .to_string()
     }
 
+    pub fn resolve_config_path() -> Result<Option<PathBuf>, MicroClawError> {
+        // 1. Check MICROCLAW_CONFIG env var for custom path
+        if let Ok(custom) = std::env::var("MICROCLAW_CONFIG") {
+            if std::path::Path::new(&custom).exists() {
+                return Ok(Some(PathBuf::from(custom)));
+            }
+            return Err(MicroClawError::Config(format!(
+                "MICROCLAW_CONFIG points to non-existent file: {custom}"
+            )));
+        }
+
+        if std::path::Path::new("./microclaw.config.yaml").exists() {
+            return Ok(Some(PathBuf::from("./microclaw.config.yaml")));
+        }
+        if std::path::Path::new("./microclaw.config.yml").exists() {
+            return Ok(Some(PathBuf::from("./microclaw.config.yml")));
+        }
+        Ok(None)
+    }
+
     /// Load config from YAML file.
     pub fn load() -> Result<Self, MicroClawError> {
-        // 1. Check MICROCLAW_CONFIG env var for custom path
-        let yaml_path = if let Ok(custom) = std::env::var("MICROCLAW_CONFIG") {
-            if std::path::Path::new(&custom).exists() {
-                Some(custom)
-            } else {
-                return Err(MicroClawError::Config(format!(
-                    "MICROCLAW_CONFIG points to non-existent file: {custom}"
-                )));
-            }
-        } else if std::path::Path::new("./microclaw.config.yaml").exists() {
-            Some("./microclaw.config.yaml".into())
-        } else if std::path::Path::new("./microclaw.config.yml").exists() {
-            Some("./microclaw.config.yml".into())
-        } else {
-            None
-        };
+        let yaml_path = Self::resolve_config_path()?;
 
         if let Some(path) = yaml_path {
+            let path_str = path.to_string_lossy().to_string();
             let content = std::fs::read_to_string(&path)
-                .map_err(|e| MicroClawError::Config(format!("Failed to read {path}: {e}")))?;
+                .map_err(|e| MicroClawError::Config(format!("Failed to read {path_str}: {e}")))?;
             let mut config: Config = serde_yaml::from_str(&content)
-                .map_err(|e| MicroClawError::Config(format!("Failed to parse {path}: {e}")))?;
+                .map_err(|e| MicroClawError::Config(format!("Failed to parse {path_str}: {e}")))?;
             config.post_deserialize()?;
             return Ok(config);
         }
@@ -182,6 +209,19 @@ impl Config {
         }
         if self.working_dir.trim().is_empty() {
             self.working_dir = default_working_dir();
+        }
+        if self.web_host.trim().is_empty() {
+            self.web_host = default_web_host();
+        }
+        if let Some(token) = &self.web_auth_token {
+            if token.trim().is_empty() {
+                self.web_auth_token = None;
+            }
+        }
+        if self.web_enabled && !is_local_web_host(&self.web_host) && self.web_auth_token.is_none() {
+            return Err(MicroClawError::Config(
+                "web_auth_token is required when web_enabled=true and web_host is not local".into(),
+            ));
         }
 
         // Validate required fields
@@ -237,6 +277,10 @@ mod tests {
             discord_bot_token: None,
             discord_allowed_channels: vec![],
             show_thinking: false,
+            web_enabled: false,
+            web_host: "127.0.0.1".into(),
+            web_port: 3900,
+            web_auth_token: None,
         }
     }
 
@@ -405,6 +449,24 @@ mod tests {
         config.post_deserialize().unwrap();
         assert_eq!(config.llm_provider, "anthropic");
         assert_eq!(config.model, "claude-sonnet-4-5-20250929");
+    }
+
+    #[test]
+    fn test_post_deserialize_web_non_local_requires_token() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nweb_enabled: true\nweb_host: 0.0.0.0\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let err = config.post_deserialize().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("web_auth_token is required when web_enabled=true"));
+    }
+
+    #[test]
+    fn test_post_deserialize_web_non_local_with_token_ok() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nweb_enabled: true\nweb_host: 0.0.0.0\nweb_auth_token: token123\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert_eq!(config.web_auth_token.as_deref(), Some("token123"));
     }
 
     #[test]

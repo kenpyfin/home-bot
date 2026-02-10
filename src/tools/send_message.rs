@@ -1,17 +1,30 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::json;
 use teloxide::prelude::*;
 
-use super::{authorize_chat_access, schema_object, Tool, ToolResult};
+use super::{auth_context_from_input, authorize_chat_access, schema_object, Tool, ToolResult};
 use crate::claude::ToolDefinition;
+use crate::db::{Database, StoredMessage};
 
 pub struct SendMessageTool {
     bot: Bot,
+    db: Arc<Database>,
+    bot_username: String,
 }
 
 impl SendMessageTool {
-    pub fn new(bot: Bot) -> Self {
-        SendMessageTool { bot }
+    pub fn new(bot: Bot, db: Arc<Database>, bot_username: String) -> Self {
+        SendMessageTool {
+            bot,
+            db,
+            bot_username,
+        }
+    }
+
+    fn is_web_chat(&self, chat_id: i64) -> bool {
+        matches!(self.db.get_chat_type(chat_id), Ok(Some(ref t)) if t == "web")
     }
 }
 
@@ -24,12 +37,12 @@ impl Tool for SendMessageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "send_message".into(),
-            description: "Send a message to a Telegram chat mid-conversation. Use this when you want to send intermediate updates, progress reports, or multiple messages before your final response.".into(),
+            description: "Send a message mid-conversation. For Telegram chats it sends via Telegram; for local web chats it appends to the web conversation.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
-                        "description": "The chat ID to send the message to (use the current chat_id from system prompt)"
+                        "description": "The target chat ID"
                     },
                     "text": {
                         "type": "string",
@@ -55,9 +68,33 @@ impl Tool for SendMessageTool {
             return ToolResult::error(e);
         }
 
-        match self.bot.send_message(ChatId(chat_id), text).await {
-            Ok(_) => ToolResult::success("Message sent successfully.".into()),
-            Err(e) => ToolResult::error(format!("Failed to send message: {e}")),
+        // Web callers are intentionally scoped to their own chat to avoid cross-channel actions.
+        if let Some(auth) = auth_context_from_input(&input) {
+            if self.is_web_chat(auth.caller_chat_id) && auth.caller_chat_id != chat_id {
+                return ToolResult::error(
+                    "Permission denied: web chats cannot send messages to other chats".into(),
+                );
+            }
+        }
+
+        if self.is_web_chat(chat_id) {
+            let msg = StoredMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                chat_id,
+                sender_name: self.bot_username.clone(),
+                content: text.to_string(),
+                is_from_bot: true,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            };
+            match self.db.store_message(&msg) {
+                Ok(_) => ToolResult::success("Message sent successfully.".into()),
+                Err(e) => ToolResult::error(format!("Failed to send message: {e}")),
+            }
+        } else {
+            match self.bot.send_message(ChatId(chat_id), text).await {
+                Ok(_) => ToolResult::success("Message sent successfully.".into()),
+                Err(e) => ToolResult::error(format!("Failed to send message: {e}")),
+            }
         }
     }
 }
@@ -67,9 +104,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn test_db() -> (Arc<Database>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("microclaw_sendmsg_{}", uuid::Uuid::new_v4()));
+        let db = Arc::new(Database::new(dir.to_str().unwrap()).unwrap());
+        (db, dir)
+    }
+
+    fn cleanup(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn test_send_message_permission_denied_before_network() {
-        let tool = SendMessageTool::new(Bot::new("123456:TEST_TOKEN"));
+        let (db, dir) = test_db();
+        let tool = SendMessageTool::new(Bot::new("123456:TEST_TOKEN"), db, "bot".into());
         let result = tool
             .execute(json!({
                 "chat_id": 200,
@@ -82,11 +130,41 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("Permission denied"));
+        cleanup(&dir);
     }
 
     #[tokio::test]
-    async fn test_send_message_control_chat_not_blocked_by_permission_layer() {
-        let tool = SendMessageTool::new(Bot::new("123456:TEST_TOKEN"));
+    async fn test_send_message_web_target_writes_to_db() {
+        let (db, dir) = test_db();
+        db.upsert_chat(999, Some("web-main"), "web").unwrap();
+
+        let tool = SendMessageTool::new(Bot::new("123456:TEST_TOKEN"), db.clone(), "bot".into());
+        let result = tool
+            .execute(json!({
+                "chat_id": 999,
+                "text": "hello web",
+                "__microclaw_auth": {
+                    "caller_chat_id": 999,
+                    "control_chat_ids": []
+                }
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+
+        let all = db.get_all_messages(999).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].content, "hello web");
+        assert!(all[0].is_from_bot);
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_web_caller_cross_chat_denied() {
+        let (db, dir) = test_db();
+        db.upsert_chat(100, Some("web-main"), "web").unwrap();
+        db.upsert_chat(200, Some("tg"), "private").unwrap();
+
+        let tool = SendMessageTool::new(Bot::new("123456:TEST_TOKEN"), db, "bot".into());
         let result = tool
             .execute(json!({
                 "chat_id": 200,
@@ -97,7 +175,10 @@ mod tests {
                 }
             }))
             .await;
-        // With fake token this may still fail on network/auth, but must not fail on permission layer.
-        assert!(!result.content.contains("Permission denied"));
+        assert!(result.is_error);
+        assert!(result
+            .content
+            .contains("web chats cannot send messages to other chats"));
+        cleanup(&dir);
     }
 }

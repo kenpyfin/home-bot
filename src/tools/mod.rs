@@ -151,7 +151,11 @@ impl ToolRegistry {
             Box::new(memory::WriteMemoryTool::new(&config.data_dir)),
             Box::new(web_fetch::WebFetchTool),
             Box::new(web_search::WebSearchTool),
-            Box::new(send_message::SendMessageTool::new(bot)),
+            Box::new(send_message::SendMessageTool::new(
+                bot,
+                db.clone(),
+                config.bot_username.clone(),
+            )),
             Box::new(schedule::ScheduleTaskTool::new(
                 db.clone(),
                 config.timezone.clone(),

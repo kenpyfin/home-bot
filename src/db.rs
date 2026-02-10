@@ -19,6 +19,15 @@ pub struct StoredMessage {
 }
 
 #[derive(Debug, Clone)]
+pub struct ChatSummary {
+    pub chat_id: i64,
+    pub chat_title: Option<String>,
+    pub chat_type: String,
+    pub last_message_time: String,
+    pub last_message_preview: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct TaskRunLog {
     pub id: i64,
@@ -205,6 +214,58 @@ impl Database {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
+    }
+
+    pub fn get_chats_by_type(
+        &self,
+        chat_type: &str,
+        limit: usize,
+    ) -> Result<Vec<ChatSummary>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT
+                c.chat_id,
+                c.chat_title,
+                c.chat_type,
+                c.last_message_time,
+                (
+                    SELECT m.content
+                    FROM messages m
+                    WHERE m.chat_id = c.chat_id
+                    ORDER BY m.timestamp DESC
+                    LIMIT 1
+                ) AS last_message_preview
+             FROM chats c
+             WHERE c.chat_type = ?1
+             ORDER BY c.last_message_time DESC
+             LIMIT ?2",
+        )?;
+        let chats = stmt
+            .query_map(params![chat_type, limit as i64], |row| {
+                Ok(ChatSummary {
+                    chat_id: row.get(0)?,
+                    chat_title: row.get(1)?,
+                    chat_type: row.get(2)?,
+                    last_message_time: row.get(3)?,
+                    last_message_preview: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(chats)
+    }
+
+    pub fn get_chat_type(&self, chat_id: i64) -> Result<Option<String>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT chat_type FROM chats WHERE chat_id = ?1",
+            params![chat_id],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Get messages since the bot's last response in this chat.

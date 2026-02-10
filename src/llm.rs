@@ -898,6 +898,10 @@ mod tests {
             discord_bot_token: None,
             discord_allowed_channels: vec![],
             show_thinking: false,
+            web_enabled: false,
+            web_host: "127.0.0.1".into(),
+            web_port: 3900,
+            web_auth_token: None,
         };
         // Should not panic
         let _provider = create_provider(&config);
@@ -930,6 +934,10 @@ mod tests {
             discord_bot_token: None,
             discord_allowed_channels: vec![],
             show_thinking: false,
+            web_enabled: false,
+            web_host: "127.0.0.1".into(),
+            web_port: 3900,
+            web_auth_token: None,
         };
         let _provider = create_provider(&config);
     }

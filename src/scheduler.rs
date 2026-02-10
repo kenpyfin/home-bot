@@ -36,8 +36,15 @@ async fn run_due_tasks(state: &Arc<AppState>) {
         let started_at = Utc::now();
         let started_at_str = started_at.to_rfc3339();
 
+        let chat_type = state
+            .db
+            .get_chat_type(task.chat_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "private".into());
+
         // Run agent loop with the task prompt
-        let (success, result_summary) = match crate::telegram::process_with_claude(
+        let (success, result_summary) = match crate::telegram::process_with_agent(
             state,
             task.chat_id,
             "scheduler",
@@ -49,8 +56,29 @@ async fn run_due_tasks(state: &Arc<AppState>) {
         {
             Ok(response) => {
                 if !response.is_empty() {
-                    crate::telegram::send_response(&state.bot, ChatId(task.chat_id), &response)
-                        .await;
+                    if chat_type == "web" {
+                        let bot_msg = crate::db::StoredMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            chat_id: task.chat_id,
+                            sender_name: state.config.bot_username.clone(),
+                            content: response.clone(),
+                            is_from_bot: true,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        };
+                        let _ = state.db.store_message(&bot_msg);
+                    } else {
+                        crate::telegram::send_response(&state.bot, ChatId(task.chat_id), &response)
+                            .await;
+                        let bot_msg = crate::db::StoredMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            chat_id: task.chat_id,
+                            sender_name: state.config.bot_username.clone(),
+                            content: response.clone(),
+                            is_from_bot: true,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        };
+                        let _ = state.db.store_message(&bot_msg);
+                    }
                 }
                 let summary = if response.len() > 200 {
                     format!("{}...", &response[..response.floor_char_boundary(200)])
@@ -61,13 +89,32 @@ async fn run_due_tasks(state: &Arc<AppState>) {
             }
             Err(e) => {
                 error!("Scheduler: task #{} failed: {e}", task.id);
-                let _ = state
-                    .bot
-                    .send_message(
-                        ChatId(task.chat_id),
-                        format!("Scheduled task #{} failed: {e}", task.id),
-                    )
-                    .await;
+                let err_text = format!("Scheduled task #{} failed: {e}", task.id);
+                if chat_type == "web" {
+                    let bot_msg = crate::db::StoredMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        chat_id: task.chat_id,
+                        sender_name: state.config.bot_username.clone(),
+                        content: err_text.clone(),
+                        is_from_bot: true,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = state.db.store_message(&bot_msg);
+                } else {
+                    let _ = state
+                        .bot
+                        .send_message(ChatId(task.chat_id), &err_text)
+                        .await;
+                    let bot_msg = crate::db::StoredMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        chat_id: task.chat_id,
+                        sender_name: state.config.bot_username.clone(),
+                        content: err_text,
+                        is_from_bot: true,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = state.db.store_message(&bot_msg);
+                }
                 (false, Some(format!("Error: {e}")))
             }
         };

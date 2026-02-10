@@ -383,6 +383,10 @@ fn default_config() -> Config {
         discord_bot_token: None,
         discord_allowed_channels: vec![],
         show_thinking: false,
+        web_enabled: false,
+        web_host: "127.0.0.1".into(),
+        web_port: 3900,
+        web_auth_token: None,
     }
 }
 

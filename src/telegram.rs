@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use teloxide::prelude::*;
 use teloxide::types::ChatAction;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info};
 
 use crate::claude::{ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock};
@@ -38,6 +39,18 @@ pub struct AppState {
     pub skills: SkillManager,
     pub llm: Box<dyn LlmProvider>,
     pub tools: ToolRegistry,
+}
+
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    Iteration { iteration: usize },
+    ToolStart { name: String },
+    ToolResult {
+        name: String,
+        is_error: bool,
+        preview: String,
+    },
+    FinalResponse { text: String },
 }
 
 pub async fn run_bot(
@@ -95,6 +108,18 @@ pub async fn run_bot(
         info!("Starting Discord bot");
         tokio::spawn(async move {
             crate::discord::start_discord_bot(discord_state, &token).await;
+        });
+    }
+
+    // Start local web server if enabled
+    if state.config.web_enabled {
+        let web_state = state.clone();
+        info!(
+            "Starting Web UI server on {}:{}",
+            state.config.web_host, state.config.web_port
+        );
+        tokio::spawn(async move {
+            crate::web::start_web_server(web_state).await;
         });
     }
 
@@ -335,7 +360,7 @@ async fn handle_message(
     });
 
     // Process with Claude
-    match process_with_claude(&state, chat_id, &sender_name, chat_type, None, image_data).await {
+    match process_with_agent(&state, chat_id, &sender_name, chat_type, None, image_data).await {
         Ok(response) => {
             typing_handle.abort();
 
@@ -396,13 +421,34 @@ fn guess_image_media_type(data: &[u8]) -> String {
     }
 }
 
-pub async fn process_with_claude(
+pub async fn process_with_agent(
     state: &AppState,
     chat_id: i64,
     _sender_name: &str,
     chat_type: &str,
     override_prompt: Option<&str>,
     image_data: Option<(String, String)>,
+) -> anyhow::Result<String> {
+    process_with_agent_with_events(
+        state,
+        chat_id,
+        _sender_name,
+        chat_type,
+        override_prompt,
+        image_data,
+        None,
+    )
+    .await
+}
+
+pub async fn process_with_agent_with_events(
+    state: &AppState,
+    chat_id: i64,
+    _sender_name: &str,
+    chat_type: &str,
+    override_prompt: Option<&str>,
+    image_data: Option<(String, String)>,
+    event_tx: Option<&UnboundedSender<AgentEvent>>,
 ) -> anyhow::Result<String> {
     // Build system prompt
     let memory_context = state.memory.build_memory_context(chat_id);
@@ -504,6 +550,11 @@ pub async fn process_with_claude(
 
     // Agentic tool-use loop
     for iteration in 0..state.config.max_tool_iterations {
+        if let Some(tx) = event_tx {
+            let _ = tx.send(AgentEvent::Iteration {
+                iteration: iteration + 1,
+            });
+        }
         let response = state
             .llm
             .send_message(&system_prompt, messages.clone(), Some(tool_defs.clone()))
@@ -538,6 +589,11 @@ pub async fn process_with_claude(
             } else {
                 strip_thinking(&text)
             };
+            if let Some(tx) = event_tx {
+                let _ = tx.send(AgentEvent::FinalResponse {
+                    text: display_text.clone(),
+                });
+            }
             return Ok(display_text);
         }
 
@@ -565,11 +621,27 @@ pub async fn process_with_claude(
             let mut tool_results = Vec::new();
             for block in &response.content {
                 if let ResponseContentBlock::ToolUse { id, name, input } = block {
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(AgentEvent::ToolStart { name: name.clone() });
+                    }
                     info!("Executing tool: {} (iteration {})", name, iteration + 1);
                     let result = state
                         .tools
                         .execute_with_auth(name, input.clone(), &tool_auth)
                         .await;
+                    if let Some(tx) = event_tx {
+                        let preview = if result.content.chars().count() > 160 {
+                            let clipped = result.content.chars().take(160).collect::<String>();
+                            format!("{clipped}...")
+                        } else {
+                            result.content.clone()
+                        };
+                        let _ = tx.send(AgentEvent::ToolResult {
+                            name: name.clone(),
+                            is_error: result.is_error,
+                            preview,
+                        });
+                    }
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
                         content: result.content,
@@ -610,6 +682,9 @@ pub async fn process_with_claude(
         return Ok(if text.is_empty() {
             "(no response)".into()
         } else {
+            if let Some(tx) = event_tx {
+                let _ = tx.send(AgentEvent::FinalResponse { text: text.clone() });
+            }
             text
         });
     }
@@ -627,6 +702,11 @@ pub async fn process_with_claude(
         let _ = state.db.save_session(chat_id, &json);
     }
 
+    if let Some(tx) = event_tx {
+        let _ = tx.send(AgentEvent::FinalResponse {
+            text: max_iter_msg.clone(),
+        });
+    }
     Ok(max_iter_msg)
 }
 

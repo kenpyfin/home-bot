@@ -54,3 +54,14 @@ compact_keep_recent: 20
 # Discord (optional)
 # discord_bot_token: ""
 # discord_allowed_channels: []
+
+# Local web UI (optional)
+# Enable built-in local web chat + config panel
+web_enabled: false
+# Bind address for local web UI
+web_host: "127.0.0.1"
+# Port for local web UI
+web_port: 3900
+# Optional bearer token for Web API/UI.
+# If set, requests must send Authorization: Bearer <token>
+# web_auth_token: ""
