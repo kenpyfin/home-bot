@@ -19,7 +19,9 @@ use tracing::{error, info};
 use crate::channel::deliver_and_store_bot_message;
 use crate::config::{Config, WorkingDirIsolation};
 use crate::db::{call_blocking, ChatSummary, StoredMessage};
-use crate::telegram::{process_with_agent, process_with_agent_with_events, AgentEvent, AppState};
+use crate::telegram::{
+    process_with_agent, process_with_agent_with_events, AgentEvent, AgentRequestContext, AppState,
+};
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web/dist");
 
@@ -1088,10 +1090,11 @@ async fn send_and_store_response_with_events(
     let response = if let Some(tx) = event_tx {
         process_with_agent_with_events(
             &state.app_state,
-            "web",
-            chat_id,
-            &sender_name,
-            "private",
+            AgentRequestContext {
+                caller_channel: "web",
+                chat_id,
+                chat_type: "private",
+            },
             None,
             None,
             Some(tx),
@@ -1101,10 +1104,11 @@ async fn send_and_store_response_with_events(
     } else {
         process_with_agent(
             &state.app_state,
-            "web",
-            chat_id,
-            &sender_name,
-            "private",
+            AgentRequestContext {
+                caller_channel: "web",
+                chat_id,
+                chat_type: "private",
+            },
             None,
             None,
         )

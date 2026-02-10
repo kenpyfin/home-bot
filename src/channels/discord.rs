@@ -10,7 +10,7 @@ use tracing::{error, info};
 use crate::claude::Message as ClaudeMessage;
 use crate::db::call_blocking;
 use crate::db::StoredMessage;
-use crate::telegram::{archive_conversation, AppState};
+use crate::telegram::{archive_conversation, AgentRequestContext, AppState};
 
 struct Handler {
     app_state: Arc<AppState>,
@@ -137,13 +137,14 @@ impl EventHandler for Handler {
         // Process with Claude (reuses the same agentic loop as Telegram)
         match crate::telegram::process_with_agent(
             &self.app_state,
-            "discord",
-            channel_id,
-            &sender_name,
-            if msg.guild_id.is_some() {
-                "group"
-            } else {
-                "private"
+            AgentRequestContext {
+                caller_channel: "discord",
+                chat_id: channel_id,
+                chat_type: if msg.guild_id.is_some() {
+                    "group"
+                } else {
+                    "private"
+                },
             },
             None,
             None,

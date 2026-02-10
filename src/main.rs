@@ -87,7 +87,7 @@ CONFIG FILE (microclaw.config.yaml):
       discord_allowed_channels    List of channel IDs to respond in (empty = all)
 
 MCP (optional):
-    Place a mcp.json file in data_dir to connect MCP servers.
+    Place a mcp.json file in data_dir (default: ./microclaw.data) to connect MCP servers.
     See https://modelcontextprotocol.io for details.
 
 EXAMPLES:

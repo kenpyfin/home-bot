@@ -42,6 +42,13 @@ pub struct AppState {
     pub tools: ToolRegistry,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AgentRequestContext<'a> {
+    pub caller_channel: &'a str,
+    pub chat_id: i64,
+    pub chat_type: &'a str,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Iteration {
@@ -496,10 +503,11 @@ async fn handle_message(
     // Process with Claude
     match process_with_agent(
         &state,
-        "telegram",
-        chat_id,
-        &sender_name,
-        runtime_chat_type,
+        AgentRequestContext {
+            caller_channel: "telegram",
+            chat_id,
+            chat_type: runtime_chat_type,
+        },
         None,
         image_data,
     )
@@ -567,36 +575,22 @@ fn guess_image_media_type(data: &[u8]) -> String {
 
 pub async fn process_with_agent(
     state: &AppState,
-    caller_channel: &str,
-    chat_id: i64,
-    _sender_name: &str,
-    chat_type: &str,
+    context: AgentRequestContext<'_>,
     override_prompt: Option<&str>,
     image_data: Option<(String, String)>,
 ) -> anyhow::Result<String> {
-    process_with_agent_with_events(
-        state,
-        caller_channel,
-        chat_id,
-        _sender_name,
-        chat_type,
-        override_prompt,
-        image_data,
-        None,
-    )
-    .await
+    process_with_agent_with_events(state, context, override_prompt, image_data, None).await
 }
 
 pub async fn process_with_agent_with_events(
     state: &AppState,
-    caller_channel: &str,
-    chat_id: i64,
-    _sender_name: &str,
-    chat_type: &str,
+    context: AgentRequestContext<'_>,
     override_prompt: Option<&str>,
     image_data: Option<(String, String)>,
     event_tx: Option<&UnboundedSender<AgentEvent>>,
 ) -> anyhow::Result<String> {
+    let chat_id = context.chat_id;
+
     // Build system prompt
     let memory_context = state.memory.build_memory_context(chat_id);
     let skills_catalog = state.skills.build_skills_catalog();
@@ -616,7 +610,7 @@ pub async fn process_with_agent_with_events(
 
         if session_messages.is_empty() {
             // Corrupted session, fall back to DB history
-            load_messages_from_db(state, chat_id, chat_type).await?
+            load_messages_from_db(state, chat_id, context.chat_type).await?
         } else {
             // Get new user messages since session was last saved
             let updated_at_cloned = updated_at.clone();
@@ -645,7 +639,7 @@ pub async fn process_with_agent_with_events(
         }
     } else {
         // No session — build from DB history
-        load_messages_from_db(state, chat_id, chat_type).await?
+        load_messages_from_db(state, chat_id, context.chat_type).await?
     };
 
     // If override_prompt is provided (from scheduler), add it as a user message
@@ -697,7 +691,7 @@ pub async fn process_with_agent_with_events(
 
     let tool_defs = state.tools.definitions();
     let tool_auth = ToolAuthContext {
-        caller_channel: caller_channel.to_string(),
+        caller_channel: context.caller_channel.to_string(),
         caller_chat_id: chat_id,
         control_chat_ids: state.config.control_chat_ids.clone(),
     };

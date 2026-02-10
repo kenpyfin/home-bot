@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 use crate::db::call_blocking;
 use crate::db::StoredMessage;
-use crate::telegram::AppState;
+use crate::telegram::{AgentRequestContext, AppState};
 
 // --- Webhook query params for verification ---
 
@@ -201,10 +201,11 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                 // Process with Claude (reuses the same agentic loop as Telegram)
                 match crate::telegram::process_with_agent(
                     &state.app_state,
-                    "whatsapp",
-                    chat_id,
-                    &sender_name,
-                    "private",
+                    AgentRequestContext {
+                        caller_channel: "whatsapp",
+                        chat_id,
+                        chat_type: "private",
+                    },
                     None,
                     None,
                 )

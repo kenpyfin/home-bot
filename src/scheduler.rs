@@ -6,7 +6,7 @@ use tracing::{error, info};
 
 use crate::channel::deliver_and_store_bot_message;
 use crate::db::call_blocking;
-use crate::telegram::AppState;
+use crate::telegram::{AgentRequestContext, AppState};
 
 fn channel_from_chat_type(chat_type: &str) -> &'static str {
     match chat_type {
@@ -54,10 +54,11 @@ async fn run_due_tasks(state: &Arc<AppState>) {
         // Run agent loop with the task prompt
         let (success, result_summary) = match crate::telegram::process_with_agent(
             state,
-            channel,
-            task.chat_id,
-            "scheduler",
-            "private",
+            AgentRequestContext {
+                caller_channel: channel,
+                chat_id: task.chat_id,
+                chat_type: "private",
+            },
             Some(&task.prompt),
             None,
         )

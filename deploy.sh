@@ -40,6 +40,9 @@ if [ ! -x "$ROOT_DIR/scripts/release_homebrew.sh" ]; then
   exit 1
 fi
 
+echo "Running pre-deploy checks..."
+cargo clippy --all-targets -- -D warnings
+
 echo "Starting deploy ($MODE)..."
 "$ROOT_DIR/scripts/release_homebrew.sh"
 
