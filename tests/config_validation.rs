@@ -1,6 +1,6 @@
 //! Integration tests for configuration loading and validation.
 
-use microclaw::config::{Config, WorkingDirIsolation};
+use microclaw::config::Config;
 
 /// Helper to create a minimal valid config for testing.
 fn minimal_config() -> Config {
@@ -17,7 +17,6 @@ fn minimal_config() -> Config {
         max_document_size_mb: 100,
         data_dir: "./microclaw.data".into(),
         working_dir: "./tmp".into(),
-        working_dir_isolation: WorkingDirIsolation::Chat,
         openai_api_key: None,
         timezone: "UTC".into(),
         allowed_groups: vec![],
@@ -40,6 +39,16 @@ fn minimal_config() -> Config {
         web_rate_window_seconds: 10,
         web_run_history_limit: 512,
         web_session_idle_ttl_seconds: 300,
+        browser_managed: false,
+        browser_executable_path: None,
+        browser_cdp_port_base: 9222,
+        browser_idle_timeout_secs: None,
+        browser_headless: false,
+        agent_browser_path: None,
+        cursor_agent_cli_path: "cursor-agent".into(),
+        cursor_agent_model: String::new(),
+        cursor_agent_timeout_secs: 600,
+        social: None,
     }
 }
 
@@ -57,10 +66,6 @@ fn test_yaml_parse_minimal() {
     assert_eq!(config.max_document_size_mb, 100);
     assert_eq!(config.max_history_messages, 50);
     assert_eq!(config.timezone, "UTC");
-    assert!(matches!(
-        config.working_dir_isolation,
-        WorkingDirIsolation::Chat
-    ));
     assert_eq!(config.max_session_messages, 40);
     assert_eq!(config.compact_keep_recent, 20);
     assert_eq!(config.whatsapp_webhook_port, 8080);

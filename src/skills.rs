@@ -16,6 +16,9 @@ pub struct SkillMetadata {
 #[derive(Debug, Deserialize, Default)]
 struct SkillFrontmatter {
     name: Option<String>,
+    /// Alternative to name (e.g. some skills use title)
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     description: String,
     #[serde(default)]
@@ -74,10 +77,19 @@ impl SkillManager {
             if !path.is_dir() {
                 continue;
             }
-            let skill_md = path.join("SKILL.md");
-            if !skill_md.exists() {
-                continue;
-            }
+            let skill_md = {
+                let p = path.join("SKILL.md");
+                if p.exists() {
+                    p
+                } else {
+                    let p = path.join("skill.md");
+                    if p.exists() {
+                        p
+                    } else {
+                        continue;
+                    }
+                }
+            };
             if let Ok(content) = std::fs::read_to_string(&skill_md) {
                 if let Some((meta, _body)) = parse_skill_md(&content, &path) {
                     if include_unavailable || self.skill_is_available(&meta).is_ok() {
@@ -107,10 +119,14 @@ impl SkillManager {
 
             self.skill_is_available(&skill)?;
 
-            let skill_md = skill.dir_path.join("SKILL.md");
-            if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                if let Some((meta, body)) = parse_skill_md(&content, &skill.dir_path) {
-                    return Ok((meta, body));
+            for filename in ["SKILL.md", "skill.md"] {
+                let skill_md = skill.dir_path.join(filename);
+                if skill_md.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                        if let Some((meta, body)) = parse_skill_md(&content, &skill.dir_path) {
+                            return Ok((meta, body));
+                        }
+                    }
                 }
             }
             return Err(format!("Skill '{name}' exists but could not be loaded."));
@@ -168,18 +184,50 @@ impl SkillManager {
     }
 
     /// Build a user-facing formatted list of available skills.
+    /// Shows the skills directory path and, if any skills in the folder are unavailable (platform/deps), lists them too.
     pub fn list_skills_formatted(&self) -> String {
-        let skills = self.discover_skills();
-        if skills.is_empty() {
-            return "No skills available on this platform/runtime.".into();
+        let skills_dir_display = self.skills_dir.to_string_lossy();
+        let all = self.discover_skills_internal(true);
+        let available: Vec<_> = self.discover_skills();
+
+        if available.is_empty() && all.is_empty() {
+            return format!(
+                "No skills found in:\n{}\n(Add skill folders with SKILL.md or skill.md.)",
+                skills_dir_display
+            );
         }
-        let mut output = format!("Available skills ({}):\n\n", skills.len());
-        for skill in &skills {
+
+        let mut output = format!("Loaded from: {}\n\n", skills_dir_display);
+        if available.is_empty() {
+            output.push_str("No skills available on this platform/runtime (see below).\n\n");
+        } else {
+            output.push_str(&format!("Available skills ({}):\n\n", available.len()));
+            for skill in &available {
+                output.push_str(&format!(
+                    "• {} — {} [{}]\n",
+                    skill.name, skill.description, skill.source
+                ));
+            }
+        }
+
+        let unavailable: Vec<_> = all
+            .iter()
+            .filter(|s| !available.iter().any(|a| a.name == s.name))
+            .collect();
+        if !unavailable.is_empty() {
             output.push_str(&format!(
-                "• {} — {} [{}]\n",
-                skill.name, skill.description, skill.source
+                "\nPresent in folder but not available on this platform/runtime ({}):\n",
+                unavailable.len()
             ));
+            for skill in &unavailable {
+                let reason = self
+                    .skill_is_available(skill)
+                    .err()
+                    .unwrap_or_else(|| "unknown".into());
+                output.push_str(&format!("  • {} — {}\n", skill.name, reason));
+            }
         }
+
         output
     }
 
@@ -298,10 +346,12 @@ fn parse_skill_md(content: &str, dir_path: &std::path::Path) -> Option<(SkillMet
     }
 
     let fm: SkillFrontmatter = serde_yaml::from_str(&yaml_block).ok()?;
-    let name = fm.name?.trim().to_string();
-    if name.is_empty() {
-        return None;
-    }
+    let name = fm
+        .name
+        .or(fm.title)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let name = name?;
 
     let mut platforms: Vec<String> = fm
         .platforms

@@ -10,6 +10,7 @@ use tracing::{error, info};
 use crate::claude::Message as ClaudeMessage;
 use crate::db::call_blocking;
 use crate::db::StoredMessage;
+use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::telegram::{archive_conversation, AgentRequestContext, AppState};
 
 struct Handler {
@@ -39,53 +40,67 @@ impl EventHandler for Handler {
             return;
         }
 
-        // Handle /reset command
-        if text.trim() == "/reset" {
-            let _ = call_blocking(self.app_state.db.clone(), move |db| {
-                db.delete_session(channel_id)
-            })
-            .await;
-            let _ = msg.channel_id.say(&ctx.http, "Session cleared.").await;
-            return;
-        }
-
-        // Handle /skills command
-        if text.trim() == "/skills" {
-            let formatted = self.app_state.skills.list_skills_formatted();
-            let _ = msg.channel_id.say(&ctx.http, &formatted).await;
-            return;
-        }
-
-        // Handle /archive command
-        if text.trim() == "/archive" {
-            if let Ok(Some((json, _))) = call_blocking(self.app_state.db.clone(), move |db| {
-                db.load_session(channel_id)
-            })
-            .await
-            {
-                let messages: Vec<ClaudeMessage> = serde_json::from_str(&json).unwrap_or_default();
-                if messages.is_empty() {
+        // Single entry point: parse slash command first. If command, run backend handler and return — never send to LLM.
+        if let Some(cmd) = parse_slash_command(&text) {
+            match cmd {
+                SlashCommand::Reset => {
+                    let pid = call_blocking(self.app_state.db.clone(), move |db| db.get_or_create_default_persona(channel_id)).await.unwrap_or(0);
+                    if pid > 0 {
+                        let _ = call_blocking(self.app_state.db.clone(), move |db| db.delete_session(channel_id, pid)).await;
+                    }
                     let _ = msg
                         .channel_id
-                        .say(&ctx.http, "No session to archive.")
-                        .await;
-                } else {
-                    archive_conversation(&self.app_state.config.data_dir, channel_id, &messages);
-                    let _ = msg
-                        .channel_id
-                        .say(&ctx.http, format!("Archived {} messages.", messages.len()))
+                        .say(
+                            &ctx.http,
+                            "Conversation cleared. Principles and per-persona memory are unchanged.",
+                        )
                         .await;
                 }
-            } else {
-                let _ = msg
-                    .channel_id
-                    .say(&ctx.http, "No session to archive.")
-                    .await;
+                SlashCommand::Skills => {
+                    let formatted = self.app_state.skills.list_skills_formatted();
+                    let _ = msg.channel_id.say(&ctx.http, &formatted).await;
+                }
+                SlashCommand::Persona => {
+                    let resp = crate::persona::handle_persona_command(self.app_state.db.clone(), channel_id, text.trim()).await;
+                    let _ = msg.channel_id.say(&ctx.http, resp).await;
+                }
+                SlashCommand::Archive => {
+                    let pid = call_blocking(self.app_state.db.clone(), move |db| db.get_or_create_default_persona(channel_id)).await.unwrap_or(0);
+                    if pid == 0 {
+                        let _ = msg.channel_id.say(&ctx.http, "No session to archive.").await;
+                    } else {
+                        let pid_f = pid;
+                        if let Ok(Some((json, _))) = call_blocking(self.app_state.db.clone(), move |db| {
+                            db.load_session(channel_id, pid_f)
+                        })
+                        .await
+                        {
+                            let messages: Vec<ClaudeMessage> = serde_json::from_str(&json).unwrap_or_default();
+                            if messages.is_empty() {
+                                let _ = msg.channel_id.say(&ctx.http, "No session to archive.").await;
+                            } else {
+                                archive_conversation(&self.app_state.config.data_dir, channel_id, &messages);
+                                let _ = msg
+                                    .channel_id
+                                    .say(&ctx.http, format!("Archived {} messages.", messages.len()))
+                                    .await;
+                            }
+                        } else {
+                            let _ = msg.channel_id.say(&ctx.http, "No session to archive.").await;
+                        }
+                    }
+                }
             }
             return;
         }
 
         if text.is_empty() {
+            return;
+        }
+
+        // Resolve persona
+        let persona_id = call_blocking(self.app_state.db.clone(), move |db| db.get_or_create_default_persona(channel_id)).await.unwrap_or(0);
+        if persona_id == 0 {
             return;
         }
 
@@ -99,6 +114,7 @@ impl EventHandler for Handler {
         let stored = StoredMessage {
             id: msg.id.get().to_string(),
             chat_id: channel_id,
+            persona_id,
             sender_name: sender_name.clone(),
             content: text.clone(),
             is_from_bot: false,
@@ -145,6 +161,7 @@ impl EventHandler for Handler {
                 } else {
                     "private"
                 },
+                persona_id,
             },
             None,
             None,
@@ -160,6 +177,7 @@ impl EventHandler for Handler {
                     let bot_msg = StoredMessage {
                         id: uuid::Uuid::new_v4().to_string(),
                         chat_id: channel_id,
+                        persona_id,
                         sender_name: self.app_state.config.bot_username.clone(),
                         content: response,
                         is_from_bot: true,

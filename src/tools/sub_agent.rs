@@ -5,8 +5,6 @@ use tracing::info;
 use super::{auth_context_from_input, schema_object, Tool, ToolRegistry, ToolResult};
 use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock, ToolDefinition};
 use crate::config::Config;
-#[cfg(test)]
-use crate::config::WorkingDirIsolation;
 
 const MAX_SUB_AGENT_ITERATIONS: usize = 10;
 
@@ -63,7 +61,7 @@ impl Tool for SubAgentTool {
         let tools = ToolRegistry::new_sub_agent(&self.config);
         let tool_defs = tools.definitions();
 
-        let system_prompt = "You are a sub-agent assistant. Complete the given task thoroughly and return a clear, concise result. You have access to tools for file operations, search, and web access. Focus on the task and provide actionable output.".to_string();
+        let system_prompt = "You are a sub-agent assistant. Complete the given task thoroughly and return a clear, concise result. You have access to tools for file operations, search, web access, and browser automation (use the browser tool only, not bash). Focus on the task and provide actionable output.".to_string();
 
         let user_content = if context.is_empty() {
             task.to_string()
@@ -200,7 +198,6 @@ mod tests {
             max_document_size_mb: 100,
             data_dir: "/tmp".into(),
             working_dir: "/tmp".into(),
-            working_dir_isolation: WorkingDirIsolation::Shared,
             openai_api_key: None,
             timezone: "UTC".into(),
             allowed_groups: vec![],
@@ -223,6 +220,16 @@ mod tests {
             web_rate_window_seconds: 10,
             web_run_history_limit: 512,
             web_session_idle_ttl_seconds: 300,
+            browser_managed: false,
+            browser_executable_path: None,
+            browser_cdp_port_base: 9222,
+            browser_idle_timeout_secs: None,
+            browser_headless: false,
+            agent_browser_path: None,
+            cursor_agent_cli_path: "cursor-agent".into(),
+            cursor_agent_model: String::new(),
+            cursor_agent_timeout_secs: 600,
+            social: None,
         }
     }
 
@@ -253,7 +260,7 @@ mod tests {
         let config = test_config();
         let registry = ToolRegistry::new_sub_agent(&config);
         let defs = registry.definitions();
-        assert_eq!(defs.len(), 11);
+        assert_eq!(defs.len(), 12);
     }
 
     #[test]
@@ -273,11 +280,13 @@ mod tests {
         assert!(names.contains(&"web_search"));
         assert!(names.contains(&"web_fetch"));
         assert!(names.contains(&"read_memory"));
+        assert!(names.contains(&"read_tiered_memory"));
 
         // Should NOT include
         assert!(!names.contains(&"sub_agent"));
         assert!(!names.contains(&"send_message"));
         assert!(!names.contains(&"write_memory"));
+        assert!(!names.contains(&"write_tiered_memory"));
         assert!(!names.contains(&"schedule_task"));
         assert!(!names.contains(&"list_scheduled_tasks"));
         assert!(!names.contains(&"pause_scheduled_task"));

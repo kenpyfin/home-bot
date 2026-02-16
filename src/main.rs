@@ -1,3 +1,4 @@
+use microclaw::claude::{Message, MessageContent};
 use microclaw::config::Config;
 use microclaw::error::MicroClawError;
 use microclaw::{
@@ -21,6 +22,7 @@ COMMANDS:
     gateway     Manage gateway service (install/uninstall/start/stop/status/logs)
     config      Run interactive Q&A config flow (recommended)
     doctor      Run preflight diagnostics (cross-platform)
+    test-llm [--with-tools]   Test LLM connection (use --with-tools to send tools like Telegram)
     setup       Run interactive setup wizard
     version     Show version information
     help        Show this help message
@@ -66,7 +68,6 @@ CONFIG FILE (microclaw.config.yaml):
     Runtime:
       data_dir               Data root (runtime in ./microclaw.data/runtime, skills in ./microclaw.data/skills)
       working_dir            Default tool working directory (default: ./tmp)
-      working_dir_isolation  Tool working-dir mode: shared or chat (default: chat)
       max_tokens             Max tokens per response (default: 8192)
       max_tool_iterations    Max tool loop iterations (default: 100)
       max_history_messages   Chat history context size (default: 50)
@@ -100,6 +101,8 @@ EXAMPLES:
     microclaw config              Run interactive Q&A config flow
     microclaw doctor              Run preflight diagnostics
     microclaw doctor --json       Output diagnostics as JSON
+    microclaw test-llm            Test LLM API connection (no tools)
+    microclaw test-llm --with-tools   Test LLM with full tool list (like Telegram)
     microclaw setup               Run full-screen setup wizard
     microclaw version             Show version
     microclaw help                Show this message
@@ -111,6 +114,78 @@ ABOUT:
 
 fn print_version() {
     println!("microclaw {VERSION}");
+}
+
+async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(MicroClawError::Config(e)) => {
+            eprintln!("Config error: {e}");
+            eprintln!("Set MICROCLAW_CONFIG or create microclaw.config.yaml");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Failed to load config: {e}");
+            std::process::exit(1);
+        }
+    };
+    let provider = microclaw::llm::create_provider(&config);
+    let messages = vec![Message {
+        role: "user".into(),
+        content: MessageContent::Text("Reply with exactly: OK".into()),
+    }];
+    let tools_arg = if with_tools {
+        let runtime_data_dir = config.runtime_data_dir();
+        let db = match db::Database::new(&runtime_data_dir) {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => {
+                eprintln!("Database init failed (needed for --with-tools): {e}");
+                std::process::exit(1);
+            }
+        };
+        let token = if config.telegram_bot_token.is_empty() {
+            "dummy"
+        } else {
+            &config.telegram_bot_token
+        };
+        let bot = teloxide::Bot::new(token);
+        let tools = microclaw::tools::ToolRegistry::new(&config, bot, db.clone());
+        let defs = tools.definitions();
+        println!("Testing with {} tools (same as Telegram).", defs.len());
+        Some(defs)
+    } else {
+        None
+    };
+    println!(
+        "Testing LLM: provider={} model={} base={}{}",
+        config.llm_provider,
+        config.model,
+        config.llm_base_url.as_deref().unwrap_or("(default)"),
+        if with_tools { " (with tools)" } else { "" }
+    );
+    match provider
+        .send_message("You are a test assistant.", messages, tools_arg)
+        .await
+    {
+        Ok(resp) => {
+            let text = resp
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    microclaw::claude::ResponseContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            let usage = resp.usage.as_ref().map(|u| format!(" (input: {} output: {} tokens)", u.input_tokens, u.output_tokens)).unwrap_or_default();
+            println!("LLM OK. Response: {}{}", text.trim(), usage);
+        }
+        Err(e) => {
+            eprintln!("LLM error: {e}");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
 }
 
 fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -211,6 +286,11 @@ async fn main() -> anyhow::Result<()> {
             doctor::run_cli(&args[2..])?;
             return Ok(());
         }
+        Some("test-llm") => {
+            let with_tools = args.get(2).map(|s| s.as_str()) == Some("--with-tools");
+            run_test_llm(with_tools).await?;
+            return Ok(());
+        }
         Some("version" | "--version" | "-V") => {
             print_version();
             return Ok(());
@@ -258,7 +338,7 @@ async fn main() -> anyhow::Result<()> {
     let db = db::Database::new(&runtime_data_dir)?;
     info!("Database initialized");
 
-    let memory_manager = memory::MemoryManager::new(&runtime_data_dir);
+    let memory_manager = memory::MemoryManager::new(&runtime_data_dir, &config.working_dir);
     info!("Memory manager initialized");
 
     let skill_manager = skills::SkillManager::from_skills_dir(&skills_data_dir);

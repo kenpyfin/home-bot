@@ -1,0 +1,59 @@
+---
+description: Social feed integration (TikTok, Instagram, LinkedIn) - setup, config, and troubleshooting
+alwaysApply: false
+globs: microclaw.config.yaml,src/tools/social_feed.rs,src/social_oauth.rs
+---
+
+# Social Feed Integration
+
+## Overview
+
+MicroClaw includes built-in tools for fetching user feeds: `fetch_tiktok_feed`, `fetch_instagram_feed`, `fetch_linkedin_feed`. These use official platform APIs and require one-time OAuth per user per platform.
+
+## Config (microclaw.config.yaml)
+
+```yaml
+social:
+  base_url: "http://127.0.0.1:10961"   # or public URL for OAuth callbacks
+  linkedin:
+    client_id: "xxx"
+    client_secret: "xxx"
+  tiktok:
+    client_id: "xxx"
+    client_secret: "xxx"
+  instagram:
+    client_id: "xxx"
+    client_secret: "xxx"
+```
+
+- **base_url**: Required. Must be reachable for OAuth callbacks. Use ngrok for local dev.
+- **Per platform**: Both `client_id` and `client_secret` must be non-empty for tools to register.
+
+## Tool Registration
+
+Tools are added to `ToolRegistry` at **startup only**. If config changes, restart MicroClaw.
+
+Startup logs to verify:
+- `Social feed tools registered: fetch_linkedin_feed`
+- `Tool registry initialized (N tools): ..., fetch_linkedin_feed`
+
+## OAuth Flow
+
+1. User asks for feed → tool returns authorize link if no token
+2. User clicks link → platform OAuth → redirects to `/api/oauth/callback/{platform}`
+3. Callback exchanges code, stores token in `social_oauth_tokens` table
+4. Next request uses stored token
+
+## Key Files
+
+- `src/tools/social_feed.rs` - Tool implementations
+- `src/social_oauth.rs` - OAuth URL generation, token exchange
+- `src/web.rs` - OAuth routes: `/api/oauth/authorize/:platform`, `/api/oauth/callback/:platform`
+- `src/db.rs` - `social_oauth_tokens`, `oauth_pending_states` tables
+- `microclaw.data/skills/social-feed/SKILL.md` - Agent skill instructions
+
+## Troubleshooting
+
+- **Tools "not exposed"**: Restart after config change. Check startup log for tool list.
+- **TerminatedByOtherGetUpdates**: Multiple bot instances running; stop duplicates.
+- **Config not loaded**: Set `MICROCLAW_CONFIG` to absolute path when running as service.

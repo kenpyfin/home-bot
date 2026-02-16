@@ -350,6 +350,36 @@ fn check_node_and_browser(report: &mut DoctorReport) {
             Some("Run `npm install -g agent-browser && agent-browser install`.".to_string())
         },
     );
+
+    let cursor_agent_path = Config::load()
+        .map(|c| c.cursor_agent_cli_path.trim().to_string())
+        .unwrap_or_else(|_| {
+            if cfg!(target_os = "windows") {
+                "cursor-agent.cmd".into()
+            } else {
+                "cursor-agent".into()
+            }
+        });
+    let cursor_agent_ok = !cursor_agent_path.is_empty() && command_exists(&cursor_agent_path);
+    report.push(
+        "deps.cursor_agent",
+        "cursor-agent",
+        if cursor_agent_ok {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        },
+        if cursor_agent_ok {
+            "cursor-agent command found".to_string()
+        } else {
+            "cursor-agent command not found".to_string()
+        },
+        if cursor_agent_ok {
+            None
+        } else {
+            Some("Run `curl https://cursor.com/install -fsS | bash`.".to_string())
+        },
+    );
 }
 
 fn check_mcp_dependencies(report: &mut DoctorReport) {

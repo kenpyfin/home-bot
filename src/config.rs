@@ -35,9 +35,6 @@ fn default_data_dir() -> String {
 fn default_working_dir() -> String {
     "./tmp".into()
 }
-fn default_working_dir_isolation() -> WorkingDirIsolation {
-    WorkingDirIsolation::Chat
-}
 fn default_timezone() -> String {
     "UTC".into()
 }
@@ -77,16 +74,75 @@ fn default_web_run_history_limit() -> usize {
 fn default_web_session_idle_ttl_seconds() -> u64 {
     300
 }
+fn default_browser_managed() -> bool {
+    false
+}
+fn default_browser_cdp_port_base() -> u16 {
+    9222
+}
+fn default_browser_headless() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn default_cursor_agent_cli_path() -> String {
+    "cursor-agent.cmd".into()
+}
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn default_cursor_agent_cli_path() -> String {
+    "cursor-agent".into()
+}
+
+fn default_cursor_agent_model() -> String {
+    String::new()
+}
+
+fn default_cursor_agent_timeout_secs() -> u64 {
+    600
+}
+
 fn is_local_web_host(host: &str) -> bool {
     let h = host.trim().to_ascii_lowercase();
     h == "127.0.0.1" || h == "localhost" || h == "::1"
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkingDirIsolation {
-    Shared,
-    Chat,
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SocialPlatformConfig {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SocialConfig {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub tiktok: SocialPlatformConfig,
+    #[serde(default)]
+    pub instagram: SocialPlatformConfig,
+    #[serde(default)]
+    pub linkedin: SocialPlatformConfig,
+}
+
+impl SocialConfig {
+    pub fn is_platform_enabled(&self, platform: &str) -> bool {
+        let (id, secret) = match platform {
+            "tiktok" => (
+                self.tiktok.client_id.as_deref().unwrap_or(""),
+                self.tiktok.client_secret.as_deref().unwrap_or(""),
+            ),
+            "instagram" => (
+                self.instagram.client_id.as_deref().unwrap_or(""),
+                self.instagram.client_secret.as_deref().unwrap_or(""),
+            ),
+            "linkedin" => (
+                self.linkedin.client_id.as_deref().unwrap_or(""),
+                self.linkedin.client_secret.as_deref().unwrap_or(""),
+            ),
+            _ => return false,
+        };
+        !id.trim().is_empty() && !secret.trim().is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,8 +171,6 @@ pub struct Config {
     pub data_dir: String,
     #[serde(default = "default_working_dir")]
     pub working_dir: String,
-    #[serde(default = "default_working_dir_isolation")]
-    pub working_dir_isolation: WorkingDirIsolation,
     #[serde(default)]
     pub openai_api_key: Option<String>,
     #[serde(default = "default_timezone")]
@@ -161,6 +215,31 @@ pub struct Config {
     pub web_run_history_limit: usize,
     #[serde(default = "default_web_session_idle_ttl_seconds")]
     pub web_session_idle_ttl_seconds: u64,
+    #[serde(default = "default_browser_managed")]
+    pub browser_managed: bool,
+    #[serde(default)]
+    pub browser_executable_path: Option<String>,
+    #[serde(default = "default_browser_cdp_port_base")]
+    pub browser_cdp_port_base: u16,
+    /// Optional idle timeout (seconds) for managed browser processes. 0 or None = no idle shutdown.
+    #[serde(default)]
+    pub browser_idle_timeout_secs: Option<u64>,
+    #[serde(default = "default_browser_headless")]
+    pub browser_headless: bool,
+    /// Full path to the agent-browser CLI (npm). If set, the browser tool uses this instead of looking up "agent-browser" on PATH. Use when the process PATH doesn't include agent-browser (e.g. when run as a service).
+    #[serde(default)]
+    pub agent_browser_path: Option<String>,
+    /// Path to the cursor-agent CLI. Default: "cursor-agent" (or "cursor-agent.cmd" on Windows). Use when the process PATH doesn't include cursor-agent.
+    #[serde(default = "default_cursor_agent_cli_path")]
+    pub cursor_agent_cli_path: String,
+    /// Model for cursor-agent (e.g. "gpt-5"). Leave empty to omit --model (cursor-agent uses its default / "auto").
+    #[serde(default = "default_cursor_agent_model")]
+    pub cursor_agent_model: String,
+    /// Timeout in seconds for cursor-agent runs. Default: 600.
+    #[serde(default = "default_cursor_agent_timeout_secs")]
+    pub cursor_agent_timeout_secs: u64,
+    #[serde(default)]
+    pub social: Option<SocialConfig>,
 }
 
 impl Config {
@@ -283,6 +362,38 @@ impl Config {
         if self.max_document_size_mb == 0 {
             self.max_document_size_mb = default_max_document_size_mb();
         }
+        // Expand ~ in agent_browser_path if present
+        if let Some(ref p) = self.agent_browser_path {
+            let trimmed = p.trim();
+            if !trimmed.is_empty() && (trimmed == "~" || trimmed.starts_with("~/")) {
+                if let Ok(home) = std::env::var("HOME") {
+                    let expanded = if trimmed == "~" {
+                        home
+                    } else {
+                        format!("{}{}", home, &trimmed[1..])
+                    };
+                    self.agent_browser_path = Some(expanded);
+                }
+            }
+        }
+        if let Some(ref mut social) = self.social {
+            for platform_cfg in [
+                &mut social.tiktok,
+                &mut social.instagram,
+                &mut social.linkedin,
+            ] {
+                if let Some(ref id) = platform_cfg.client_id {
+                    if id.trim().is_empty() {
+                        platform_cfg.client_id = None;
+                    }
+                }
+                if let Some(ref secret) = platform_cfg.client_secret {
+                    if secret.trim().is_empty() {
+                        platform_cfg.client_secret = None;
+                    }
+                }
+            }
+        }
 
         // Validate required fields
         if self.telegram_bot_token.is_empty() && self.discord_bot_token.is_none() {
@@ -325,7 +436,6 @@ mod tests {
             max_document_size_mb: 100,
             data_dir: "./microclaw.data".into(),
             working_dir: "./tmp".into(),
-            working_dir_isolation: WorkingDirIsolation::Chat,
             openai_api_key: None,
             timezone: "UTC".into(),
             allowed_groups: vec![],
@@ -348,6 +458,16 @@ mod tests {
             web_rate_window_seconds: 10,
             web_run_history_limit: 512,
             web_session_idle_ttl_seconds: 300,
+            browser_managed: false,
+            browser_executable_path: None,
+            browser_cdp_port_base: 9222,
+            browser_idle_timeout_secs: None,
+            browser_headless: false,
+            agent_browser_path: None,
+            cursor_agent_cli_path: default_cursor_agent_cli_path(),
+            cursor_agent_model: String::new(),
+            cursor_agent_timeout_secs: 600,
+            social: None,
         }
     }
 
@@ -406,10 +526,6 @@ mod tests {
         assert_eq!(config.max_tool_iterations, 100);
         assert_eq!(config.data_dir, "./microclaw.data");
         assert_eq!(config.working_dir, "./tmp");
-        assert!(matches!(
-            config.working_dir_isolation,
-            WorkingDirIsolation::Chat
-        ));
         assert_eq!(config.max_document_size_mb, 100);
         assert_eq!(config.timezone, "UTC");
     }
@@ -420,26 +536,6 @@ mod tests {
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
         assert_eq!(config.working_dir, "./tmp");
-    }
-
-    #[test]
-    fn test_config_working_dir_isolation_defaults_to_chat() {
-        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\n";
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(
-            config.working_dir_isolation,
-            WorkingDirIsolation::Chat
-        ));
-    }
-
-    #[test]
-    fn test_config_working_dir_isolation_accepts_chat() {
-        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nworking_dir_isolation: chat\n";
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(
-            config.working_dir_isolation,
-            WorkingDirIsolation::Chat
-        ));
     }
 
     #[test]

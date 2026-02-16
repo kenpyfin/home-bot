@@ -28,6 +28,7 @@ pub fn shell_command(command: &str) -> CommandSpec {
     }
 }
 
+/// Default command name for the agent-browser executable (resolved from PATH when not overridden by config).
 pub fn agent_browser_program() -> String {
     if cfg!(target_os = "windows") {
         "agent-browser.cmd".to_string()

@@ -56,8 +56,15 @@ impl Tool for ExportChatTool {
             return ToolResult::error(e);
         }
 
+        let cid = chat_id;
+        let persona_id = match call_blocking(self.db.clone(), move |db| db.get_or_create_default_persona(cid)).await {
+            Ok(pid) => pid,
+            Err(e) => return ToolResult::error(format!("Failed to resolve persona: {e}")),
+        };
+        let cid2 = chat_id;
+        let pid = persona_id;
         let messages =
-            match call_blocking(self.db.clone(), move |db| db.get_all_messages(chat_id)).await {
+            match call_blocking(self.db.clone(), move |db| db.get_all_messages(cid2, pid)).await {
                 Ok(msgs) => msgs,
                 Err(e) => return ToolResult::error(format!("Failed to load messages: {e}")),
             };
@@ -138,9 +145,11 @@ mod tests {
     #[tokio::test]
     async fn test_export_chat_success() {
         let (db, dir) = test_db();
+        let pid = db.get_or_create_default_persona(100).unwrap();
         db.store_message(&StoredMessage {
             id: "m1".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "alice".into(),
             content: "hello".into(),
             is_from_bot: false,
@@ -150,6 +159,7 @@ mod tests {
         db.store_message(&StoredMessage {
             id: "m2".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "bot".into(),
             content: "hi there!".into(),
             is_from_bot: true,
@@ -176,9 +186,11 @@ mod tests {
     #[tokio::test]
     async fn test_export_chat_permission_denied() {
         let (db, dir) = test_db();
+        let pid = db.get_or_create_default_persona(200).unwrap();
         db.store_message(&StoredMessage {
             id: "m1".into(),
             chat_id: 200,
+            persona_id: pid,
             sender_name: "alice".into(),
             content: "hello".into(),
             is_from_bot: false,
@@ -204,9 +216,11 @@ mod tests {
     #[tokio::test]
     async fn test_export_chat_allowed_for_control_chat_cross_chat() {
         let (db, dir) = test_db();
+        let pid = db.get_or_create_default_persona(200).unwrap();
         db.store_message(&StoredMessage {
             id: "m1".into(),
             chat_id: 200,
+            persona_id: pid,
             sender_name: "alice".into(),
             content: "hello".into(),
             is_from_bot: false,

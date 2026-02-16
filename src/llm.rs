@@ -12,8 +12,6 @@ use crate::claude::{
     ResponseContentBlock, ToolDefinition, Usage,
 };
 use crate::config::Config;
-#[cfg(test)]
-use crate::config::WorkingDirIsolation;
 use crate::error::MicroClawError;
 
 /// Remove orphaned `ToolResult` blocks whose `tool_use_id` does not match any
@@ -737,6 +735,35 @@ struct OaiErrorResponse {
 #[derive(Debug, Deserialize)]
 struct OaiErrorDetail {
     message: String,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    r#type: Option<String>,
+}
+
+fn format_oai_error(status: reqwest::StatusCode, err: &OaiErrorDetail, body: &str) -> String {
+    let status = status.as_u16();
+    let extra: Vec<String> = [
+        err.r#type.as_deref().map(|t| format!("type={t}")),
+        err.code.as_deref().map(|c| format!("code={c}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let extra_str = if extra.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", extra.join(", "))
+    };
+    let body_preview = if body.len() > 400 {
+        format!("{}...", &body[..400])
+    } else {
+        body.to_string()
+    };
+    format!(
+        "HTTP {}: {}{}. Response: {}",
+        status, err.message, extra_str, body_preview
+    )
 }
 
 #[async_trait]
@@ -800,7 +827,8 @@ impl LlmProvider for OpenAiProvider {
 
             let text = response.text().await.unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
-                return Err(MicroClawError::LlmApi(err.error.message));
+                let msg = format_oai_error(status, &err.error, &text);
+                return Err(MicroClawError::LlmApi(msg));
             }
             return Err(MicroClawError::LlmApi(format!("HTTP {status}: {text}")));
         }
@@ -841,7 +869,8 @@ impl LlmProvider for OpenAiProvider {
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
-                return Err(MicroClawError::LlmApi(err.error.message));
+                let msg = format_oai_error(status, &err.error, &text);
+                return Err(MicroClawError::LlmApi(msg));
             }
             return Err(MicroClawError::LlmApi(format!("HTTP {status}: {text}")));
         }
@@ -916,6 +945,9 @@ impl LlmProvider for OpenAiProvider {
 // Format translation helpers  (internal Anthropic-style ↔ OpenAI)
 // ---------------------------------------------------------------------------
 
+/// Minimal non-whitespace content so Vertex AI / Gemini gateways never treat the prompt as "no parts".
+const GEMINI_MINIMAL_PARTS: &str = ".";
+
 fn translate_messages_to_oai(system: &str, messages: &[Message]) -> Vec<serde_json::Value> {
     // Collect all tool_use IDs present in assistant messages so we can
     // skip orphaned tool_results (e.g. after session compaction).
@@ -936,7 +968,7 @@ fn translate_messages_to_oai(system: &str, messages: &[Message]) -> Vec<serde_js
 
     let mut out: Vec<serde_json::Value> = Vec::new();
 
-    // System message
+    // System message. Gemini requires at least one "parts" in the request; empty content can cause INVALID_ARGUMENT.
     if !system.is_empty() {
         out.push(json!({"role": "system", "content": system}));
     }
@@ -944,7 +976,13 @@ fn translate_messages_to_oai(system: &str, messages: &[Message]) -> Vec<serde_js
     for msg in messages {
         match &msg.content {
             MessageContent::Text(text) => {
-                out.push(json!({"role": msg.role, "content": text}));
+                // Ensure non-empty content so Gemini/Vertex receives at least one parts field.
+                let content = if text.is_empty() {
+                    GEMINI_MINIMAL_PARTS
+                } else {
+                    text.as_str()
+                };
+                out.push(json!({"role": msg.role, "content": content}));
             }
             MessageContent::Blocks(blocks) => {
                 if msg.role == "assistant" {
@@ -974,9 +1012,14 @@ fn translate_messages_to_oai(system: &str, messages: &[Message]) -> Vec<serde_js
                         .collect();
 
                     let mut m = json!({"role": "assistant"});
-                    if !text.is_empty() || tool_calls.is_empty() {
-                        m["content"] = json!(text);
-                    }
+                    // Gemini/Vertex require every message to have at least one "parts"; assistant with only
+                    // tool_calls has no content otherwise, so always set non-whitespace placeholder when empty.
+                    let content = if text.is_empty() {
+                        GEMINI_MINIMAL_PARTS
+                    } else {
+                        text.as_str()
+                    };
+                    m["content"] = json!(content);
                     if !tool_calls.is_empty() {
                         m["tool_calls"] = json!(tool_calls);
                     }
@@ -1039,7 +1082,13 @@ fn translate_messages_to_oai(system: &str, messages: &[Message]) -> Vec<serde_js
                                     _ => None,
                                 })
                                 .collect();
-                            out.push(json!({"role": "user", "content": parts}));
+                            // Gemini/Vertex require at least one part; use non-whitespace placeholder if empty.
+                            let content = if parts.is_empty() {
+                                json!([{"type": "text", "text": GEMINI_MINIMAL_PARTS}])
+                            } else {
+                                json!(parts)
+                            };
+                            out.push(json!({"role": "user", "content": content}));
                         } else {
                             let text: String = blocks
                                 .iter()
@@ -1049,7 +1098,12 @@ fn translate_messages_to_oai(system: &str, messages: &[Message]) -> Vec<serde_js
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            out.push(json!({"role": "user", "content": text}));
+                            let content = if text.is_empty() {
+                                GEMINI_MINIMAL_PARTS.to_string()
+                            } else {
+                                text
+                            };
+                            out.push(json!({"role": "user", "content": content}));
                         }
                     }
                 }
@@ -1057,19 +1111,99 @@ fn translate_messages_to_oai(system: &str, messages: &[Message]) -> Vec<serde_js
         }
     }
 
+    // Gemini/Vertex require the prompt to have at least one "parts" field. Only prepend a
+    // placeholder user message when the first message is assistant or tool (so the prompt would
+    // have no user content). When the first message is system, gateways typically put it in
+    // system_instruction and use the next user message as the prompt — so we must not prepend
+    // a fake "user: ." or the model will respond to "." and may return nothing for the real request.
+    let first_role = out.first().and_then(|m| m.get("role").and_then(|r| r.as_str()));
+    if !out.is_empty()
+        && first_role != Some("user")
+        && (first_role == Some("assistant") || first_role == Some("tool"))
+    {
+        out.insert(
+            0,
+            json!({"role": "user", "content": GEMINI_MINIMAL_PARTS}),
+        );
+    }
+
     out
+}
+
+/// Sanitize tool parameters schema so that `required` only lists keys present in
+/// `properties`. Google Gemini rejects schemas where required[i] is not in properties.
+/// MCP and other sources can send schemas with missing properties or required not in properties.
+/// Strips "enum" from each property so gateways (e.g. OpenRouter→Gemini) don't drop the
+/// property and leave required referencing missing keys.
+fn sanitize_oai_parameters(schema: &serde_json::Value) -> serde_json::Value {
+    let props_raw = schema
+        .get("properties")
+        .filter(|p| p.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    // Build properties with "enum" stripped per property; some gateways drop properties
+    // that contain "enum" when converting to Gemini, causing required to reference missing keys.
+    let props: serde_json::Map<String, serde_json::Value> = props_raw
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    let cleaned = if let Some(obj) = v.as_object() {
+                        let mut copy = serde_json::Map::new();
+                        for (pk, pv) in obj {
+                            if pk != "enum" {
+                                copy.insert(pk.clone(), pv.clone());
+                            }
+                        }
+                        serde_json::Value::Object(copy)
+                    } else {
+                        v.clone()
+                    };
+                    (k.clone(), cleaned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let props_keys: std::collections::HashSet<String> = props.keys().cloned().collect();
+    let required_filtered: Vec<String> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|k| props_keys.contains(*k))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Deduplicate and sort required for deterministic output; omit key when empty (Gemini-safe).
+    let required_set: std::collections::HashSet<String> = required_filtered.into_iter().collect();
+    let mut required_vec: Vec<String> = required_set.into_iter().collect();
+    required_vec.sort();
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "type".to_string(),
+        schema.get("type").cloned().unwrap_or(json!("object")),
+    );
+    out.insert("properties".to_string(), serde_json::Value::Object(props));
+    if !required_vec.is_empty() {
+        out.insert("required".to_string(), json!(required_vec));
+    }
+    serde_json::Value::Object(out)
 }
 
 fn translate_tools_to_oai(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
     tools
         .iter()
         .map(|t| {
+            let parameters = sanitize_oai_parameters(&t.input_schema);
             json!({
                 "type": "function",
                 "function": {
                     "name": t.name,
                     "description": t.description,
-                    "parameters": t.input_schema,
+                    "parameters": parameters,
                 }
             })
         })
@@ -1147,6 +1281,7 @@ mod tests {
     fn test_translate_messages_system_only() {
         let msgs: Vec<Message> = vec![];
         let out = translate_messages_to_oai("You are a bot.", &msgs);
+        // We only prepend for assistant/tool; system-first is left as-is so gateways use first user as prompt.
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[0]["content"], "You are a bot.");
@@ -1172,7 +1307,9 @@ mod tests {
             },
         ];
         let out = translate_messages_to_oai("sys", &msgs);
-        assert_eq!(out.len(), 3); // system + user + assistant
+        // We do not prepend when first is system so the first user message is the prompt.
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "system");
         assert_eq!(out[1]["role"], "user");
         assert_eq!(out[1]["content"], "hello");
         assert_eq!(out[2]["role"], "assistant");
@@ -1195,10 +1332,12 @@ mod tests {
             ]),
         }];
         let out = translate_messages_to_oai("", &msgs);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["role"], "assistant");
-        assert_eq!(out[0]["content"], "Let me check.");
-        let tc = out[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(out.len(), 2); // placeholder user first (Gemini), then assistant
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[0]["content"], GEMINI_MINIMAL_PARTS);
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[1]["content"], "Let me check.");
+        let tc = out[1]["tool_calls"].as_array().unwrap();
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0]["id"], "t1");
         assert_eq!(tc[0]["function"]["name"], "bash");
@@ -1225,11 +1364,14 @@ mod tests {
             },
         ];
         let out = translate_messages_to_oai("", &msgs);
-        // assistant + tool = 2 messages
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[1]["role"], "tool");
-        assert_eq!(out[1]["tool_call_id"], "t1");
-        assert_eq!(out[1]["content"], "file1.rs\nfile2.rs");
+        // placeholder user first (Gemini), then assistant + tool
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[0]["content"], GEMINI_MINIMAL_PARTS);
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[2]["role"], "tool");
+        assert_eq!(out[2]["tool_call_id"], "t1");
+        assert_eq!(out[2]["content"], "file1.rs\nfile2.rs");
     }
 
     #[test]
@@ -1253,7 +1395,10 @@ mod tests {
             },
         ];
         let out = translate_messages_to_oai("", &msgs);
-        assert_eq!(out[1]["content"], "[Error] not found");
+        // Prepend placeholder user (Gemini): [user, assistant, tool]
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2]["role"], "tool");
+        assert_eq!(out[2]["content"], "[Error] not found");
     }
 
     #[test]
@@ -1318,6 +1463,56 @@ mod tests {
         assert_eq!(out[0]["type"], "function");
         assert_eq!(out[0]["function"]["name"], "bash");
         assert_eq!(out[0]["function"]["description"], "Run bash");
+    }
+
+    #[test]
+    fn test_sanitize_oai_parameters_required_filtered() {
+        // Gemini rejects required[] that are not in properties. Sanitizer should filter.
+        let schema = json!({
+            "type": "object",
+            "properties": { "a": {"type": "string"}, "b": {"type": "integer"} },
+            "required": ["a", "missing1", "b", "missing2"]
+        });
+        let out = sanitize_oai_parameters(&schema);
+        let required = out["required"].as_array().unwrap();
+        assert_eq!(required.len(), 2);
+        assert_eq!(required[0], "a");
+        assert_eq!(required[1], "b");
+    }
+
+    #[test]
+    fn test_sanitize_oai_parameters_no_properties_or_invalid() {
+        // MCP etc can send schema without properties or with required not in properties; output safe schema.
+        let schema = json!({
+            "type": "object",
+            "required": ["ghost1", "ghost2"]
+        });
+        let out = sanitize_oai_parameters(&schema);
+        // When no valid required keys, we omit "required" or send empty.
+        assert!(out.get("required").map(|r| r.as_array().unwrap().len()).unwrap_or(0) == 0);
+        assert!(out.get("properties").is_some());
+    }
+
+    #[test]
+    fn test_sanitize_oai_parameters_strips_enum_keeps_required() {
+        // Schema with enum (e.g. write_tiered_memory) must still have required ⊆ properties
+        // after sanitize, so Gemini/OpenRouter don't reject (required[0] not defined).
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tier": { "type": "integer", "description": "Tier", "enum": [1, 2, 3] },
+                "content": { "type": "string", "description": "Content" }
+            },
+            "required": ["tier", "content"]
+        });
+        let out = sanitize_oai_parameters(&schema);
+        let props = out["properties"].as_object().unwrap();
+        assert!(props.contains_key("tier"));
+        assert!(props.contains_key("content"));
+        assert!(props["tier"].get("enum").is_none(), "enum should be stripped");
+        let required = out["required"].as_array().unwrap();
+        assert_eq!(required.len(), 2);
+        assert!(required.iter().all(|r| props.contains_key(r.as_str().unwrap())));
     }
 
     // -----------------------------------------------------------------------
@@ -1506,7 +1701,6 @@ mod tests {
             max_document_size_mb: 100,
             data_dir: "/tmp".into(),
             working_dir: "/tmp".into(),
-            working_dir_isolation: WorkingDirIsolation::Shared,
             openai_api_key: None,
             timezone: "UTC".into(),
             allowed_groups: vec![],
@@ -1529,6 +1723,16 @@ mod tests {
             web_rate_window_seconds: 10,
             web_run_history_limit: 512,
             web_session_idle_ttl_seconds: 300,
+            browser_managed: false,
+            browser_executable_path: None,
+            browser_cdp_port_base: 9222,
+            browser_idle_timeout_secs: None,
+            browser_headless: false,
+            agent_browser_path: None,
+            cursor_agent_cli_path: "cursor-agent".into(),
+            cursor_agent_model: String::new(),
+            cursor_agent_timeout_secs: 600,
+            social: None,
         };
         // Should not panic
         let _provider = create_provider(&config);
@@ -1549,7 +1753,6 @@ mod tests {
             max_document_size_mb: 100,
             data_dir: "/tmp".into(),
             working_dir: "/tmp".into(),
-            working_dir_isolation: WorkingDirIsolation::Shared,
             openai_api_key: None,
             timezone: "UTC".into(),
             allowed_groups: vec![],
@@ -1572,6 +1775,16 @@ mod tests {
             web_rate_window_seconds: 10,
             web_run_history_limit: 512,
             web_session_idle_ttl_seconds: 300,
+            browser_managed: false,
+            browser_executable_path: None,
+            browser_cdp_port_base: 9222,
+            browser_idle_timeout_secs: None,
+            browser_headless: false,
+            agent_browser_path: None,
+            cursor_agent_cli_path: "cursor-agent".into(),
+            cursor_agent_model: String::new(),
+            cursor_agent_timeout_secs: 600,
+            social: None,
         };
         let _provider = create_provider(&config);
     }

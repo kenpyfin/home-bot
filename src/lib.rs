@@ -1,6 +1,8 @@
 pub mod builtin_skills;
 pub mod channel;
 pub mod channels;
+pub mod persona;
+pub mod slash_commands;
 pub mod claude;
 pub mod config;
 pub mod config_wizard;
@@ -15,6 +17,7 @@ pub mod memory;
 pub mod scheduler;
 pub mod setup;
 pub mod skills;
+pub mod social_oauth;
 pub mod tools;
 pub mod transcribe;
 pub mod web;

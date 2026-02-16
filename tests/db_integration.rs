@@ -15,16 +15,24 @@ fn cleanup(dir: &std::path::Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn test_persona(db: &Database, chat_id: i64) -> i64 {
+    db.upsert_chat(chat_id, None, "private").unwrap();
+    db.get_or_create_default_persona(chat_id).unwrap()
+}
+
 /// Full message lifecycle: store → retrieve → verify ordering → cross-chat isolation.
 #[test]
 fn test_message_full_lifecycle() {
     let (db, dir) = test_db();
+    let pid1 = test_persona(&db, 100);
+    let pid2 = test_persona(&db, 200);
 
     // Store messages in two chats
     for i in 0..5 {
         db.store_message(&StoredMessage {
             id: format!("chat1_msg{i}"),
             chat_id: 100,
+            persona_id: pid1,
             sender_name: "alice".into(),
             content: format!("chat1 message {i}"),
             is_from_bot: false,
@@ -36,6 +44,7 @@ fn test_message_full_lifecycle() {
         db.store_message(&StoredMessage {
             id: format!("chat2_msg{i}"),
             chat_id: 200,
+            persona_id: pid2,
             sender_name: "bob".into(),
             content: format!("chat2 message {i}"),
             is_from_bot: false,
@@ -45,10 +54,10 @@ fn test_message_full_lifecycle() {
     }
 
     // Verify isolation
-    let chat1_msgs = db.get_all_messages(100).unwrap();
+    let chat1_msgs = db.get_all_messages(100, pid1).unwrap();
     assert_eq!(chat1_msgs.len(), 5);
 
-    let chat2_msgs = db.get_all_messages(200).unwrap();
+    let chat2_msgs = db.get_all_messages(200, pid2).unwrap();
     assert_eq!(chat2_msgs.len(), 3);
 
     // Verify ordering (oldest first)
@@ -56,13 +65,14 @@ fn test_message_full_lifecycle() {
     assert_eq!(chat1_msgs[4].content, "chat1 message 4");
 
     // Verify recent messages with limit
-    let recent = db.get_recent_messages(100, 2).unwrap();
+    let recent = db.get_recent_messages(100, pid1, 2).unwrap();
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0].content, "chat1 message 3"); // oldest of 2 most recent
     assert_eq!(recent[1].content, "chat1 message 4"); // most recent
 
     // Verify empty chat
-    assert!(db.get_all_messages(999).unwrap().is_empty());
+    let pid999 = test_persona(&db, 999);
+    assert!(db.get_all_messages(999, pid999).unwrap().is_empty());
 
     cleanup(&dir);
 }
@@ -71,35 +81,37 @@ fn test_message_full_lifecycle() {
 #[test]
 fn test_session_lifecycle() {
     let (db, dir) = test_db();
+    let pid = test_persona(&db, 100);
+    let pid2 = test_persona(&db, 200);
 
     // No session initially
-    assert!(db.load_session(100).unwrap().is_none());
+    assert!(db.load_session(100, pid).unwrap().is_none());
 
     // Save session
     let json1 = r#"[{"role":"user","content":"hello"}]"#;
-    db.save_session(100, json1).unwrap();
+    db.save_session(100, pid, json1).unwrap();
 
     // Load and verify
-    let (loaded, ts1) = db.load_session(100).unwrap().unwrap();
+    let (loaded, ts1) = db.load_session(100, pid).unwrap().unwrap();
     assert_eq!(loaded, json1);
     assert!(!ts1.is_empty());
 
     // Update session (upsert)
     std::thread::sleep(std::time::Duration::from_millis(10));
     let json2 = r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#;
-    db.save_session(100, json2).unwrap();
+    db.save_session(100, pid, json2).unwrap();
 
-    let (loaded2, ts2) = db.load_session(100).unwrap().unwrap();
+    let (loaded2, ts2) = db.load_session(100, pid).unwrap().unwrap();
     assert_eq!(loaded2, json2);
     assert!(ts2 >= ts1); // updated_at should be newer
 
     // Sessions are per-chat isolated
-    assert!(db.load_session(200).unwrap().is_none());
+    assert!(db.load_session(200, pid2).unwrap().is_none());
 
     // Delete
-    assert!(db.delete_session(100).unwrap());
-    assert!(db.load_session(100).unwrap().is_none());
-    assert!(!db.delete_session(100).unwrap()); // already gone
+    assert!(db.delete_session(100, pid).unwrap());
+    assert!(db.load_session(100, pid).unwrap().is_none());
+    assert!(!db.delete_session(100, pid).unwrap()); // already gone
 
     cleanup(&dir);
 }
@@ -239,6 +251,7 @@ fn test_task_run_log_lifecycle() {
 #[test]
 fn test_catch_up_query_complex() {
     let (db, dir) = test_db();
+    let pid = test_persona(&db, 100);
 
     // Simulate group conversation
     let messages = vec![
@@ -260,6 +273,7 @@ fn test_catch_up_query_complex() {
         db.store_message(&StoredMessage {
             id: id.to_string(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: sender.to_string(),
             content: content.to_string(),
             is_from_bot: *is_bot,
@@ -270,7 +284,7 @@ fn test_catch_up_query_complex() {
 
     // Should get bot message + everything after it
     let catchup = db
-        .get_messages_since_last_bot_response(100, 50, 50)
+        .get_messages_since_last_bot_response(100, pid, 50, 50)
         .unwrap();
     assert!(catchup.len() >= 3); // at least bot msg + 3 after
     assert_eq!(catchup[0].id, "m3"); // starts with bot msg
@@ -283,6 +297,7 @@ fn test_catch_up_query_complex() {
 #[test]
 fn test_new_user_messages_since() {
     let (db, dir) = test_db();
+    let pid = test_persona(&db, 100);
 
     let messages = vec![
         ("m1", "alice", "old", false, "2024-01-01T00:00:01Z"),
@@ -296,6 +311,7 @@ fn test_new_user_messages_since() {
         db.store_message(&StoredMessage {
             id: id.to_string(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: sender.to_string(),
             content: content.to_string(),
             is_from_bot: *is_bot,
@@ -306,7 +322,7 @@ fn test_new_user_messages_since() {
 
     // Only non-bot messages after the cutoff
     let new_msgs = db
-        .get_new_user_messages_since(100, "2024-01-01T00:00:03Z")
+        .get_new_user_messages_since(100, pid, "2024-01-01T00:00:03Z")
         .unwrap();
     // m3 is at exactly 03Z, but query is >, so only m5 (timestamp > 03Z and not bot)
     assert_eq!(new_msgs.len(), 1);
@@ -322,11 +338,13 @@ fn test_chat_and_messages_together() {
 
     // Upsert chat first
     db.upsert_chat(100, Some("Test Group"), "group").unwrap();
+    let pid = test_persona(&db, 100);
 
     // Store message
     db.store_message(&StoredMessage {
         id: "msg1".into(),
         chat_id: 100,
+        persona_id: pid,
         sender_name: "alice".into(),
         content: "hello".into(),
         is_from_bot: false,
@@ -338,7 +356,7 @@ fn test_chat_and_messages_together() {
     db.upsert_chat(100, Some("Renamed Group"), "group").unwrap();
 
     // Messages still there
-    let msgs = db.get_all_messages(100).unwrap();
+    let msgs = db.get_all_messages(100, pid).unwrap();
     assert_eq!(msgs.len(), 1);
 
     cleanup(&dir);

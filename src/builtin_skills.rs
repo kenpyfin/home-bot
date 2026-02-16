@@ -86,6 +86,7 @@ mod tests {
             "apple-calendar",
             "weather",
             "find-skills",
+            "social-feed",
         ] {
             let skill_file = skills_root.join(skill).join("SKILL.md");
             assert!(skill_file.exists(), "missing built-in skill: {skill}");

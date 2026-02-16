@@ -2,6 +2,7 @@ pub mod activate_skill;
 pub mod bash;
 pub mod browser;
 pub mod command_runner;
+pub mod cursor_agent;
 pub mod edit_file;
 pub mod export_chat;
 pub mod glob;
@@ -12,9 +13,10 @@ pub mod path_guard;
 pub mod read_file;
 pub mod schedule;
 pub mod send_message;
+pub mod social_feed;
 pub mod sub_agent;
 pub mod sync_skills;
-pub mod todo;
+pub mod tiered_memory;
 pub mod web_fetch;
 pub mod web_html;
 pub mod web_search;
@@ -29,7 +31,7 @@ use serde_json::json;
 use teloxide::prelude::*;
 
 use crate::claude::ToolDefinition;
-use crate::config::{Config, WorkingDirIsolation};
+use crate::config::Config;
 use crate::db::Database;
 
 pub struct ToolResult {
@@ -96,10 +98,11 @@ impl ToolRisk {
 
 pub fn tool_risk(name: &str) -> ToolRisk {
     match name {
-        "bash" => ToolRisk::High,
+        "bash" | "cursor_agent" => ToolRisk::High,
         "write_file"
         | "edit_file"
         | "write_memory"
+        | "write_tiered_memory"
         | "send_message"
         | "sync_skills"
         | "schedule_task"
@@ -149,6 +152,7 @@ fn requires_high_risk_approval(name: &str, auth: &ToolAuthContext) -> bool {
 pub struct ToolAuthContext {
     pub caller_channel: String,
     pub caller_chat_id: i64,
+    pub caller_persona_id: i64,
     pub control_chat_ids: Vec<i64>,
 }
 
@@ -159,6 +163,12 @@ impl ToolAuthContext {
 
     pub fn can_access_chat(&self, target_chat_id: i64) -> bool {
         self.is_control_chat() || self.caller_chat_id == target_chat_id
+    }
+
+    /// True if the caller can access the given (chat_id, persona_id) for memory/tiered operations.
+    pub fn can_access_chat_persona(&self, target_chat_id: i64, target_persona_id: i64) -> bool {
+        self.is_control_chat()
+            || (self.caller_chat_id == target_chat_id && self.caller_persona_id == target_persona_id)
     }
 }
 
@@ -172,6 +182,10 @@ pub fn auth_context_from_input(input: &serde_json::Value) -> Option<ToolAuthCont
         .unwrap_or("telegram")
         .to_string();
     let caller_chat_id = ctx.get("caller_chat_id")?.as_i64()?;
+    let caller_persona_id = ctx
+        .get("caller_persona_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     let control_chat_ids = ctx
         .get("control_chat_ids")
         .and_then(|v| v.as_array())
@@ -180,6 +194,7 @@ pub fn auth_context_from_input(input: &serde_json::Value) -> Option<ToolAuthCont
     Some(ToolAuthContext {
         caller_channel,
         caller_chat_id,
+        caller_persona_id,
         control_chat_ids,
     })
 }
@@ -196,6 +211,23 @@ pub fn authorize_chat_access(input: &serde_json::Value, target_chat_id: i64) -> 
     Ok(())
 }
 
+/// Authorize access to (chat_id, persona_id) for tiered memory. Fails if auth is missing or cannot access that pair.
+pub fn authorize_chat_persona_access(
+    input: &serde_json::Value,
+    target_chat_id: i64,
+    target_persona_id: i64,
+) -> Result<(), String> {
+    let auth = auth_context_from_input(input)
+        .ok_or_else(|| "Permission denied: no auth context".to_string())?;
+    if !auth.can_access_chat_persona(target_chat_id, target_persona_id) {
+        return Err(format!(
+            "Permission denied: cannot access memory for chat {} persona {}",
+            target_chat_id, target_persona_id
+        ));
+    }
+    Ok(())
+}
+
 fn inject_auth_context(input: serde_json::Value, auth: &ToolAuthContext) -> serde_json::Value {
     let mut obj = match input {
         serde_json::Value::Object(map) => map,
@@ -206,6 +238,7 @@ fn inject_auth_context(input: serde_json::Value, auth: &ToolAuthContext) -> serd
         json!({
             "caller_channel": auth.caller_channel,
             "caller_chat_id": auth.caller_chat_id,
+            "caller_persona_id": auth.caller_persona_id,
             "control_chat_ids": auth.control_chat_ids,
         }),
     );
@@ -232,47 +265,9 @@ pub fn resolve_tool_path(working_dir: &Path, path: &str) -> PathBuf {
     }
 }
 
-fn sanitize_channel_segment(channel: &str) -> String {
-    let mut out = String::with_capacity(channel.len());
-    for c in channel.chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-            out.push(c.to_ascii_lowercase());
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "unknown".to_string()
-    } else {
-        out
-    }
-}
-
-fn chat_working_dir(base_working_dir: &Path, channel: &str, chat_id: i64) -> PathBuf {
-    let chat_segment = if chat_id < 0 {
-        format!("neg{}", chat_id.unsigned_abs())
-    } else {
-        chat_id.to_string()
-    };
-    base_working_dir
-        .join("chat")
-        .join(sanitize_channel_segment(channel))
-        .join(chat_segment)
-}
-
-pub fn resolve_tool_working_dir(
-    base_working_dir: &Path,
-    isolation: WorkingDirIsolation,
-    input: &serde_json::Value,
-) -> PathBuf {
-    let resolved = match isolation {
-        WorkingDirIsolation::Shared => base_working_dir.join("shared"),
-        WorkingDirIsolation::Chat => auth_context_from_input(input)
-            .map(|auth| {
-                chat_working_dir(base_working_dir, &auth.caller_channel, auth.caller_chat_id)
-            })
-            .unwrap_or_else(|| base_working_dir.join("shared")),
-    };
+/// Resolve the tool working directory. Always uses the shared workspace (base/shared).
+pub fn resolve_tool_working_dir(base_working_dir: &Path) -> PathBuf {
+    let resolved = base_working_dir.join("shared");
     let _ = std::fs::create_dir_all(&resolved);
     resolved
 }
@@ -289,33 +284,18 @@ impl ToolRegistry {
         }
         let skills_data_dir = config.skills_data_dir();
         let tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(bash::BashTool::new_with_isolation(
-                &config.working_dir,
-                config.working_dir_isolation,
+            Box::new(bash::BashTool::new(&config.working_dir)),
+            Box::new(browser::BrowserTool::new(
+                &config.data_dir,
+                config.agent_browser_path.clone(),
             )),
-            Box::new(browser::BrowserTool::new(&config.data_dir)),
-            Box::new(read_file::ReadFileTool::new_with_isolation(
-                &config.working_dir,
-                config.working_dir_isolation,
-            )),
-            Box::new(write_file::WriteFileTool::new_with_isolation(
-                &config.working_dir,
-                config.working_dir_isolation,
-            )),
-            Box::new(edit_file::EditFileTool::new_with_isolation(
-                &config.working_dir,
-                config.working_dir_isolation,
-            )),
-            Box::new(glob::GlobTool::new_with_isolation(
-                &config.working_dir,
-                config.working_dir_isolation,
-            )),
-            Box::new(grep::GrepTool::new_with_isolation(
-                &config.working_dir,
-                config.working_dir_isolation,
-            )),
-            Box::new(memory::ReadMemoryTool::new(&config.data_dir)),
-            Box::new(memory::WriteMemoryTool::new(&config.data_dir)),
+            Box::new(read_file::ReadFileTool::new(&config.working_dir)),
+            Box::new(write_file::WriteFileTool::new(&config.working_dir)),
+            Box::new(edit_file::EditFileTool::new(&config.working_dir)),
+            Box::new(glob::GlobTool::new(&config.working_dir)),
+            Box::new(grep::GrepTool::new(&config.working_dir)),
+            Box::new(memory::ReadMemoryTool::new(&config.data_dir, &config.working_dir)),
+            Box::new(memory::WriteMemoryTool::new(&config.data_dir, &config.working_dir)),
             Box::new(web_fetch::WebFetchTool),
             Box::new(web_search::WebSearchTool),
             Box::new(send_message::SendMessageTool::new_with_config(
@@ -333,13 +313,35 @@ impl ToolRegistry {
             Box::new(schedule::ResumeTaskTool::new(db.clone())),
             Box::new(schedule::CancelTaskTool::new(db.clone())),
             Box::new(schedule::GetTaskHistoryTool::new(db.clone())),
-            Box::new(export_chat::ExportChatTool::new(db, &config.data_dir)),
+            Box::new(export_chat::ExportChatTool::new(db.clone(), &config.data_dir)),
             Box::new(sub_agent::SubAgentTool::new(config)),
+            Box::new(cursor_agent::CursorAgentTool::new(config, db.clone())),
+            Box::new(cursor_agent::ListCursorAgentRunsTool::new(db.clone())),
             Box::new(activate_skill::ActivateSkillTool::new(&skills_data_dir)),
             Box::new(sync_skills::SyncSkillsTool::new(&skills_data_dir)),
-            Box::new(todo::TodoReadTool::new(&config.data_dir)),
-            Box::new(todo::TodoWriteTool::new(&config.data_dir)),
+            Box::new(tiered_memory::ReadTieredMemoryTool::new(&config.data_dir)),
+            Box::new(tiered_memory::WriteTieredMemoryTool::new(&config.data_dir)),
         ];
+
+        let mut tools: Vec<Box<dyn Tool>> = tools;
+        let mut social_added = Vec::new();
+        if let Some(ref social) = config.social {
+            if social.is_platform_enabled("tiktok") {
+                tools.push(Box::new(social_feed::FetchTiktokFeedTool::new(config, db.clone())));
+                social_added.push("fetch_tiktok_feed");
+            }
+            if social.is_platform_enabled("instagram") {
+                tools.push(Box::new(social_feed::FetchInstagramFeedTool::new(config, db.clone())));
+                social_added.push("fetch_instagram_feed");
+            }
+            if social.is_platform_enabled("linkedin") {
+                tools.push(Box::new(social_feed::FetchLinkedinFeedTool::new(config, db)));
+                social_added.push("fetch_linkedin_feed");
+            }
+        }
+        if !social_added.is_empty() {
+            tracing::info!("Social feed tools registered: {}", social_added.join(", "));
+        }
         ToolRegistry { tools }
     }
 
@@ -355,32 +357,18 @@ impl ToolRegistry {
         }
         let skills_data_dir = config.skills_data_dir();
         let tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(bash::BashTool::new_with_isolation(
-                &config.working_dir,
-                config.working_dir_isolation,
+            Box::new(bash::BashTool::new(&config.working_dir)),
+            Box::new(browser::BrowserTool::new(
+                &config.data_dir,
+                config.agent_browser_path.clone(),
             )),
-            Box::new(browser::BrowserTool::new(&config.data_dir)),
-            Box::new(read_file::ReadFileTool::new_with_isolation(
-                &config.working_dir,
-                config.working_dir_isolation,
-            )),
-            Box::new(write_file::WriteFileTool::new_with_isolation(
-                &config.working_dir,
-                config.working_dir_isolation,
-            )),
-            Box::new(edit_file::EditFileTool::new_with_isolation(
-                &config.working_dir,
-                config.working_dir_isolation,
-            )),
-            Box::new(glob::GlobTool::new_with_isolation(
-                &config.working_dir,
-                config.working_dir_isolation,
-            )),
-            Box::new(grep::GrepTool::new_with_isolation(
-                &config.working_dir,
-                config.working_dir_isolation,
-            )),
-            Box::new(memory::ReadMemoryTool::new(&config.data_dir)),
+            Box::new(read_file::ReadFileTool::new(&config.working_dir)),
+            Box::new(write_file::WriteFileTool::new(&config.working_dir)),
+            Box::new(edit_file::EditFileTool::new(&config.working_dir)),
+            Box::new(glob::GlobTool::new(&config.working_dir)),
+            Box::new(grep::GrepTool::new(&config.working_dir)),
+            Box::new(memory::ReadMemoryTool::new(&config.data_dir, &config.working_dir)),
+            Box::new(tiered_memory::ReadTieredMemoryTool::new(&config.data_dir)),
             Box::new(web_fetch::WebFetchTool),
             Box::new(web_search::WebSearchTool),
             Box::new(activate_skill::ActivateSkillTool::new(&skills_data_dir)),
@@ -473,7 +461,6 @@ pub fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WorkingDirIsolation;
 
     #[test]
     fn test_tool_result_success() {
@@ -544,37 +531,8 @@ mod tests {
 
     #[test]
     fn test_resolve_tool_working_dir_shared() {
-        let dir = resolve_tool_working_dir(
-            std::path::Path::new("/tmp/work"),
-            WorkingDirIsolation::Shared,
-            &json!({
-                "__microclaw_auth": {
-                    "caller_channel": "telegram",
-                    "caller_chat_id": 123,
-                    "control_chat_ids": []
-                }
-            }),
-        );
+        let dir = resolve_tool_working_dir(std::path::Path::new("/tmp/work"));
         assert_eq!(dir, std::path::PathBuf::from("/tmp/work/shared"));
-    }
-
-    #[test]
-    fn test_resolve_tool_working_dir_chat() {
-        let dir = resolve_tool_working_dir(
-            std::path::Path::new("/tmp/work"),
-            WorkingDirIsolation::Chat,
-            &json!({
-                "__microclaw_auth": {
-                    "caller_channel": "discord",
-                    "caller_chat_id": -100123,
-                    "control_chat_ids": []
-                }
-            }),
-        );
-        assert_eq!(
-            dir,
-            std::path::PathBuf::from("/tmp/work/chat/discord/neg100123")
-        );
     }
 
     struct DummyTool {
@@ -626,6 +584,7 @@ mod tests {
         let auth = ToolAuthContext {
             caller_channel: "web".into(),
             caller_chat_id: 1,
+            caller_persona_id: 0,
             control_chat_ids: vec![],
         };
 
@@ -655,6 +614,7 @@ mod tests {
         let auth = ToolAuthContext {
             caller_channel: "telegram".into(),
             caller_chat_id: 123,
+            caller_persona_id: 1,
             control_chat_ids: vec![123],
         };
 
@@ -673,6 +633,7 @@ mod tests {
         let auth = ToolAuthContext {
             caller_channel: "web".into(),
             caller_chat_id: 1,
+            caller_persona_id: 0,
             control_chat_ids: vec![],
         };
 

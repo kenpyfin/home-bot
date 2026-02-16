@@ -38,28 +38,67 @@ async fn run_due_tasks(state: &Arc<AppState>) {
     };
 
     for task in tasks {
+        let task_id = task.id;
+        let chat_id = task.chat_id;
+        let prompt = task.prompt.clone();
+
         info!(
             "Scheduler: executing task #{} for chat {}",
-            task.id, task.chat_id
+            task_id, chat_id
         );
 
         let started_at = Utc::now();
         let started_at_str = started_at.to_rfc3339();
+
+        // Claim task immediately so the next scheduler tick (60s) won't pick it again
+        // while we're still running the agent (which can take minutes).
+        let tz: chrono_tz::Tz = state.config.timezone.parse().unwrap_or(chrono_tz::Tz::UTC);
+        let next_run = if task.schedule_type == "cron" {
+            match cron::Schedule::from_str(&task.schedule_value) {
+                Ok(schedule) => schedule.upcoming(tz).next().map(|t| t.to_rfc3339()),
+                Err(e) => {
+                    error!("Scheduler: invalid cron for task #{}: {e}", task_id);
+                    None
+                }
+            }
+        } else {
+            None // one-shot: will be marked completed by update_task_after_run
+        };
+
+        let started_for_claim = started_at_str.clone();
+        let next_run_claim = next_run.clone();
+        if let Err(e) = call_blocking(state.db.clone(), move |db| {
+            db.update_task_after_run(task_id, &started_for_claim, next_run_claim.as_deref())?;
+            Ok(())
+        })
+        .await
+        {
+            error!("Scheduler: failed to claim task #{}: {e}", task_id);
+            continue;
+        }
+
         let channel =
-            match call_blocking(state.db.clone(), move |db| db.get_chat_type(task.chat_id)).await {
+            match call_blocking(state.db.clone(), move |db| db.get_chat_type(chat_id)).await {
                 Ok(Some(chat_type)) => channel_from_chat_type(&chat_type),
                 _ => "telegram",
             };
 
-        // Run agent loop with the task prompt
+        let persona_id = call_blocking(state.db.clone(), move |db| db.get_or_create_default_persona(chat_id)).await.unwrap_or(0);
+        if persona_id == 0 {
+            error!("Scheduler: could not resolve persona for chat {}", chat_id);
+            continue;
+        }
+
+        // Run agent loop with the task prompt (may take a long time)
         let (success, result_summary) = match crate::telegram::process_with_agent(
             state,
             AgentRequestContext {
                 caller_channel: channel,
-                chat_id: task.chat_id,
+                chat_id,
                 chat_type: "private",
+                persona_id,
             },
-            Some(&task.prompt),
+            Some(&prompt),
             None,
         )
         .await
@@ -70,7 +109,8 @@ async fn run_due_tasks(state: &Arc<AppState>) {
                         &state.bot,
                         state.db.clone(),
                         &state.config.bot_username,
-                        task.chat_id,
+                        chat_id,
+                        persona_id,
                         &response,
                     )
                     .await;
@@ -83,13 +123,14 @@ async fn run_due_tasks(state: &Arc<AppState>) {
                 (true, Some(summary))
             }
             Err(e) => {
-                error!("Scheduler: task #{} failed: {e}", task.id);
-                let err_text = format!("Scheduled task #{} failed: {e}", task.id);
+                error!("Scheduler: task #{} failed: {e}", task_id);
+                let err_text = format!("Scheduled task #{} failed: {e}", task_id);
                 let _ = deliver_and_store_bot_message(
                     &state.bot,
                     state.db.clone(),
                     &state.config.bot_username,
-                    task.chat_id,
+                    chat_id,
+                    persona_id,
                     &err_text,
                 )
                 .await;
@@ -107,8 +148,8 @@ async fn run_due_tasks(state: &Arc<AppState>) {
         let finished_for_log = finished_at_str.clone();
         if let Err(e) = call_blocking(state.db.clone(), move |db| {
             db.log_task_run(
-                task.id,
-                task.chat_id,
+                task_id,
+                chat_id,
                 &started_for_log,
                 &finished_for_log,
                 duration_ms,
@@ -119,31 +160,8 @@ async fn run_due_tasks(state: &Arc<AppState>) {
         })
         .await
         {
-            error!("Scheduler: failed to log task run for #{}: {e}", task.id);
+            error!("Scheduler: failed to log task run for #{}: {e}", task_id);
         }
-
-        // Compute next run
-        let tz: chrono_tz::Tz = state.config.timezone.parse().unwrap_or(chrono_tz::Tz::UTC);
-        let next_run = if task.schedule_type == "cron" {
-            match cron::Schedule::from_str(&task.schedule_value) {
-                Ok(schedule) => schedule.upcoming(tz).next().map(|t| t.to_rfc3339()),
-                Err(e) => {
-                    error!("Scheduler: invalid cron for task #{}: {e}", task.id);
-                    None
-                }
-            }
-        } else {
-            None // one-shot
-        };
-
-        let started_for_update = started_at_str.clone();
-        if let Err(e) = call_blocking(state.db.clone(), move |db| {
-            db.update_task_after_run(task.id, &started_for_update, next_run.as_deref())?;
-            Ok(())
-        })
-        .await
-        {
-            error!("Scheduler: failed to update task #{}: {e}", task.id);
-        }
+        // Task was already claimed (next_run / status updated) before the run
     }
 }

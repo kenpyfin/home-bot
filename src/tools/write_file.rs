@@ -4,27 +4,17 @@ use std::path::PathBuf;
 use tracing::info;
 
 use crate::claude::ToolDefinition;
-use crate::config::WorkingDirIsolation;
 
 use super::{schema_object, Tool, ToolResult};
 
 pub struct WriteFileTool {
     working_dir: PathBuf,
-    working_dir_isolation: WorkingDirIsolation,
 }
 
 impl WriteFileTool {
     pub fn new(working_dir: &str) -> Self {
-        Self::new_with_isolation(working_dir, WorkingDirIsolation::Shared)
-    }
-
-    pub fn new_with_isolation(
-        working_dir: &str,
-        working_dir_isolation: WorkingDirIsolation,
-    ) -> Self {
         Self {
             working_dir: PathBuf::from(working_dir),
-            working_dir_isolation,
         }
     }
 }
@@ -60,8 +50,7 @@ impl Tool for WriteFileTool {
             Some(p) => p,
             None => return ToolResult::error("Missing 'path' parameter".into()),
         };
-        let working_dir =
-            super::resolve_tool_working_dir(&self.working_dir, self.working_dir_isolation, &input);
+        let working_dir = super::resolve_tool_working_dir(&self.working_dir);
         let resolved_path = super::resolve_tool_path(&working_dir, path);
         let resolved_path_str = resolved_path.to_string_lossy().to_string();
 

@@ -28,12 +28,8 @@ max_document_size_mb: 100
 # - built-in/custom skills are loaded from <data_dir>/skills
 data_dir: "./microclaw.data"
 # Default working directory for file/bash/search tools.
-# Relative paths used by tools are resolved from this directory.
+# Tools use working_dir/shared as the workspace (single shared space; no per-chat isolation).
 working_dir: "./tmp"
-# Working-dir isolation mode for bash/read_file/write_file/edit_file/glob/grep:
-# - "shared": uses working_dir/shared
-# - "chat": each chat uses working_dir/chat/<channel>/<chat_id>
-working_dir_isolation: "chat"
 # IANA timezone for scheduling (e.g. "US/Eastern", "Europe/London")
 timezone: "UTC"
 
@@ -47,7 +43,7 @@ compact_keep_recent: 20
 # Telegram group allowlist (empty = allow all groups)
 # allowed_groups: []
 
-# Control chats can operate across chats (send_message/schedule/memory global/export/todo).
+# Control chats can operate across chats (send_message/schedule/export/tiered memory).
 # Non-control chats are restricted to their own chat_id.
 # control_chat_ids: []
 
@@ -81,3 +77,30 @@ web_rate_window_seconds: 10
 web_run_history_limit: 512
 # Idle cleanup TTL for web session quota/locks (seconds)
 web_session_idle_ttl_seconds: 300
+
+# Browser automation uses the agent-browser CLI (npm install -g agent-browser;
+# agent-browser install). If agent-browser is not on PATH (e.g. when run as a service),
+# set the full path here. Tilde is expanded (e.g. ~/.local/bin/agent-browser).
+# agent_browser_path: "~/.local/bin/agent-browser"
+
+# Cursor CLI agent (cursor_agent tool). Install: curl https://cursor.com/install -fsS | bash
+# Path to cursor-agent binary (default: cursor-agent, or cursor-agent.cmd on Windows)
+# cursor_agent_cli_path: "cursor-agent"
+# Model for cursor-agent (e.g. gpt-5). Leave empty to omit --model (use Cursor default / auto)
+# cursor_agent_model: ""
+# Timeout in seconds for cursor-agent runs (default: 600)
+# cursor_agent_timeout_secs: 600
+
+# Social media OAuth (optional). Each platform is disabled if client_id/client_secret are empty.
+# base_url must be reachable for OAuth callbacks (e.g. https://your-domain.com or ngrok URL).
+# social:
+#   base_url: "https://your-domain.com"
+#   tiktok:
+#     client_id: ""
+#     client_secret: ""
+#   instagram:   # Meta / Facebook app
+#     client_id: ""
+#     client_secret: ""
+#   linkedin:
+#     client_id: ""
+#     client_secret: ""
