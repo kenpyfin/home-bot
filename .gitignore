@@ -2,10 +2,6 @@
 microclaw.config.yaml
 microclaw.config.yaml.*
 microclaw.data/*
-!microclaw.data/skills/
-!microclaw.data/skills/**
-# Do not commit credentials in skill folders
-microclaw.data/skills/**/.env
 website/
 tmp/
 working_dir/
