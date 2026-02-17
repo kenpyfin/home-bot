@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use teloxide::prelude::*;
+use teloxide::types::ParseMode;
 
+use crate::channels::telegram::markdown_to_telegram_html;
 use crate::db::{call_blocking, Database, StoredMessage};
 use crate::tools::auth_context_from_input;
 
@@ -33,12 +35,14 @@ pub async fn deliver_and_store_bot_message(
     db: Arc<Database>,
     bot_username: &str,
     chat_id: i64,
+    persona_id: i64,
     text: &str,
 ) -> Result<(), String> {
     if is_web_chat(db.clone(), chat_id).await {
         let msg = StoredMessage {
             id: uuid::Uuid::new_v4().to_string(),
             chat_id,
+            persona_id,
             sender_name: bot_username.to_string(),
             content: text.to_string(),
             is_from_bot: true,
@@ -48,12 +52,15 @@ pub async fn deliver_and_store_bot_message(
             .await
             .map_err(|e| format!("Failed to store web message: {e}"))
     } else {
-        bot.send_message(ChatId(chat_id), text)
+        let formatted = markdown_to_telegram_html(text);
+        bot.send_message(ChatId(chat_id), &formatted)
+            .parse_mode(ParseMode::Html)
             .await
             .map_err(|e| format!("Failed to send message: {e}"))?;
         let msg = StoredMessage {
             id: uuid::Uuid::new_v4().to_string(),
             chat_id,
+            persona_id,
             sender_name: bot_username.to_string(),
             content: text.to_string(),
             is_from_bot: true,

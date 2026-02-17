@@ -29,14 +29,8 @@ fn default_max_history_messages() -> usize {
 fn default_max_document_size_mb() -> u64 {
     100
 }
-fn default_data_dir() -> String {
-    "./microclaw.data".into()
-}
-fn default_working_dir() -> String {
-    "./tmp".into()
-}
-fn default_working_dir_isolation() -> WorkingDirIsolation {
-    WorkingDirIsolation::Chat
+fn default_workspace_dir() -> String {
+    "./workspace".into()
 }
 fn default_timezone() -> String {
     "UTC".into()
@@ -77,16 +71,99 @@ fn default_web_run_history_limit() -> usize {
 fn default_web_session_idle_ttl_seconds() -> u64 {
     300
 }
+fn default_browser_managed() -> bool {
+    false
+}
+fn default_browser_cdp_port_base() -> u16 {
+    9222
+}
+fn default_browser_headless() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn default_cursor_agent_cli_path() -> String {
+    "cursor-agent.cmd".into()
+}
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn default_cursor_agent_cli_path() -> String {
+    "cursor-agent".into()
+}
+
+fn default_cursor_agent_model() -> String {
+    String::new()
+}
+
+fn default_cursor_agent_timeout_secs() -> u64 {
+    600
+}
+
 fn is_local_web_host(host: &str) -> bool {
     let h = host.trim().to_ascii_lowercase();
     h == "127.0.0.1" || h == "localhost" || h == "::1"
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkingDirIsolation {
-    Shared,
-    Chat,
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SocialPlatformConfig {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SocialConfig {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub tiktok: SocialPlatformConfig,
+    #[serde(default)]
+    pub instagram: SocialPlatformConfig,
+    #[serde(default)]
+    pub linkedin: SocialPlatformConfig,
+}
+
+/// Optional vault/vector DB config for ORIGIN Obsidian vault integration.
+/// Paths are relative to workspace_dir unless absolute.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VaultConfig {
+    /// ORIGIN vault path relative to workspace_dir (e.g. "shared/ORIGIN").
+    #[serde(default)]
+    pub origin_vault_path: Option<String>,
+    /// ChromaDB persistence dir relative to workspace_dir (e.g. "shared/vault_db").
+    #[serde(default)]
+    pub vector_db_path: Option<String>,
+    /// Embedding server URL (e.g. "http://10.0.1.211:8080" for llama.cpp).
+    #[serde(default)]
+    pub embedding_server_url: Option<String>,
+    /// Search command; use "{query}" as placeholder for the query.
+    #[serde(default)]
+    pub vault_search_command: Option<String>,
+    /// Index command to run after vault updates.
+    #[serde(default)]
+    pub vault_index_command: Option<String>,
+    /// Override principles file path relative to workspace_dir (e.g. "shared/ORIGIN/AGENTS.md"). Default: "AGENTS.md" at workspace root.
+    #[serde(default)]
+    pub principles_path: Option<String>,
+}
+
+impl SocialConfig {
+    pub fn is_platform_enabled(&self, platform: &str) -> bool {
+        let (id, secret) = match platform {
+            "tiktok" => (
+                self.tiktok.client_id.as_deref().unwrap_or(""),
+                self.tiktok.client_secret.as_deref().unwrap_or(""),
+            ),
+            "instagram" => (
+                self.instagram.client_id.as_deref().unwrap_or(""),
+                self.instagram.client_secret.as_deref().unwrap_or(""),
+            ),
+            "linkedin" => (
+                self.linkedin.client_id.as_deref().unwrap_or(""),
+                self.linkedin.client_secret.as_deref().unwrap_or(""),
+            ),
+            _ => return false,
+        };
+        !id.trim().is_empty() && !secret.trim().is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -111,12 +188,9 @@ pub struct Config {
     pub max_history_messages: usize,
     #[serde(default = "default_max_document_size_mb")]
     pub max_document_size_mb: u64,
-    #[serde(default = "default_data_dir")]
-    pub data_dir: String,
-    #[serde(default = "default_working_dir")]
-    pub working_dir: String,
-    #[serde(default = "default_working_dir_isolation")]
-    pub working_dir_isolation: WorkingDirIsolation,
+    /// Single root for runtime, skills, and tool workspace (shared). Layout: workspace_dir/runtime, workspace_dir/skills, workspace_dir/shared. Copy this folder to migrate.
+    #[serde(default = "default_workspace_dir")]
+    pub workspace_dir: String,
     #[serde(default)]
     pub openai_api_key: Option<String>,
     #[serde(default = "default_timezone")]
@@ -161,12 +235,45 @@ pub struct Config {
     pub web_run_history_limit: usize,
     #[serde(default = "default_web_session_idle_ttl_seconds")]
     pub web_session_idle_ttl_seconds: u64,
+    #[serde(default = "default_browser_managed")]
+    pub browser_managed: bool,
+    #[serde(default)]
+    pub browser_executable_path: Option<String>,
+    #[serde(default = "default_browser_cdp_port_base")]
+    pub browser_cdp_port_base: u16,
+    /// Optional idle timeout (seconds) for managed browser processes. 0 or None = no idle shutdown.
+    #[serde(default)]
+    pub browser_idle_timeout_secs: Option<u64>,
+    #[serde(default = "default_browser_headless")]
+    pub browser_headless: bool,
+    /// Full path to the agent-browser CLI (npm). If set, the browser tool uses this instead of looking up "agent-browser" on PATH. Use when the process PATH doesn't include agent-browser (e.g. when run as a service).
+    #[serde(default)]
+    pub agent_browser_path: Option<String>,
+    /// Path to the cursor-agent CLI. Default: "cursor-agent" (or "cursor-agent.cmd" on Windows). Use when the process PATH doesn't include cursor-agent.
+    #[serde(default = "default_cursor_agent_cli_path")]
+    pub cursor_agent_cli_path: String,
+    /// Model for cursor-agent (e.g. "gpt-5"). Leave empty to omit --model (cursor-agent uses its default / "auto").
+    #[serde(default = "default_cursor_agent_model")]
+    pub cursor_agent_model: String,
+    /// Timeout in seconds for cursor-agent runs. Default: 600.
+    #[serde(default = "default_cursor_agent_timeout_secs")]
+    pub cursor_agent_timeout_secs: u64,
+    #[serde(default)]
+    pub social: Option<SocialConfig>,
+    /// Optional vault/vector DB config for ORIGIN Obsidian vault integration.
+    #[serde(default)]
+    pub vault: Option<VaultConfig>,
 }
 
 impl Config {
-    /// Data root directory from config.
+    /// Data root directory (workspace root). Layout: runtime/, skills/, shared/ under this path.
     pub fn data_root_dir(&self) -> PathBuf {
-        PathBuf::from(&self.data_dir)
+        PathBuf::from(&self.workspace_dir)
+    }
+
+    /// Working directory for tools (same as workspace root; tools use workspace_dir/shared).
+    pub fn working_dir(&self) -> &str {
+        &self.workspace_dir
     }
 
     /// Runtime data directory (db, memory, exports, etc.).
@@ -183,6 +290,23 @@ impl Config {
             .join("skills")
             .to_string_lossy()
             .to_string()
+    }
+
+    /// Absolute path to the skills directory. Use this in the system prompt so the bot writes skill files to the real skills dir (file tools resolve relative paths from workspace_dir/shared).
+    pub fn skills_data_dir_absolute(&self) -> std::path::PathBuf {
+        self.workspace_root_absolute().join("skills")
+    }
+
+    /// Absolute path to the workspace root (workspace_dir resolved to absolute).
+    pub fn workspace_root_absolute(&self) -> std::path::PathBuf {
+        let root = PathBuf::from(&self.workspace_dir);
+        if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| root.clone())
+                .join(&self.workspace_dir)
+        }
     }
 
     pub fn resolve_config_path() -> Result<Option<PathBuf>, MicroClawError> {
@@ -249,8 +373,8 @@ impl Config {
                 self.llm_base_url = None;
             }
         }
-        if self.working_dir.trim().is_empty() {
-            self.working_dir = default_working_dir();
+        if self.workspace_dir.trim().is_empty() {
+            self.workspace_dir = default_workspace_dir();
         }
         if self.web_host.trim().is_empty() {
             self.web_host = default_web_host();
@@ -282,6 +406,38 @@ impl Config {
         }
         if self.max_document_size_mb == 0 {
             self.max_document_size_mb = default_max_document_size_mb();
+        }
+        // Expand ~ in agent_browser_path if present
+        if let Some(ref p) = self.agent_browser_path {
+            let trimmed = p.trim();
+            if !trimmed.is_empty() && (trimmed == "~" || trimmed.starts_with("~/")) {
+                if let Ok(home) = std::env::var("HOME") {
+                    let expanded = if trimmed == "~" {
+                        home
+                    } else {
+                        format!("{}{}", home, &trimmed[1..])
+                    };
+                    self.agent_browser_path = Some(expanded);
+                }
+            }
+        }
+        if let Some(ref mut social) = self.social {
+            for platform_cfg in [
+                &mut social.tiktok,
+                &mut social.instagram,
+                &mut social.linkedin,
+            ] {
+                if let Some(ref id) = platform_cfg.client_id {
+                    if id.trim().is_empty() {
+                        platform_cfg.client_id = None;
+                    }
+                }
+                if let Some(ref secret) = platform_cfg.client_secret {
+                    if secret.trim().is_empty() {
+                        platform_cfg.client_secret = None;
+                    }
+                }
+            }
         }
 
         // Validate required fields
@@ -323,9 +479,7 @@ mod tests {
             max_tool_iterations: 100,
             max_history_messages: 50,
             max_document_size_mb: 100,
-            data_dir: "./microclaw.data".into(),
-            working_dir: "./tmp".into(),
-            working_dir_isolation: WorkingDirIsolation::Chat,
+            workspace_dir: "./workspace".into(),
             openai_api_key: None,
             timezone: "UTC".into(),
             allowed_groups: vec![],
@@ -348,6 +502,17 @@ mod tests {
             web_rate_window_seconds: 10,
             web_run_history_limit: 512,
             web_session_idle_ttl_seconds: 300,
+            browser_managed: false,
+            browser_executable_path: None,
+            browser_cdp_port_base: 9222,
+            browser_idle_timeout_secs: None,
+            browser_headless: false,
+            agent_browser_path: None,
+            cursor_agent_cli_path: default_cursor_agent_cli_path(),
+            cursor_agent_model: String::new(),
+            cursor_agent_timeout_secs: 600,
+            social: None,
+            vault: None,
         }
     }
 
@@ -379,8 +544,7 @@ mod tests {
         config.allowed_groups = vec![123, 456];
         config.control_chat_ids = vec![999];
         assert_eq!(config.model, "claude-sonnet-4-5-20250929");
-        assert_eq!(config.data_dir, "./microclaw.data");
-        assert_eq!(config.working_dir, "./tmp");
+        assert_eq!(config.workspace_dir, "./workspace");
         assert_eq!(config.openai_api_key.as_deref(), Some("sk-test"));
         assert_eq!(config.timezone, "US/Eastern");
         assert_eq!(config.allowed_groups, vec![123, 456]);
@@ -404,42 +568,17 @@ mod tests {
         assert_eq!(config.llm_provider, "anthropic");
         assert_eq!(config.max_tokens, 8192);
         assert_eq!(config.max_tool_iterations, 100);
-        assert_eq!(config.data_dir, "./microclaw.data");
-        assert_eq!(config.working_dir, "./tmp");
-        assert!(matches!(
-            config.working_dir_isolation,
-            WorkingDirIsolation::Chat
-        ));
+        assert_eq!(config.workspace_dir, "./workspace");
         assert_eq!(config.max_document_size_mb, 100);
         assert_eq!(config.timezone, "UTC");
     }
 
     #[test]
-    fn test_post_deserialize_empty_working_dir_uses_default() {
-        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nworking_dir: '  '\n";
+    fn test_post_deserialize_empty_workspace_dir_uses_default() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nworkspace_dir: '  '\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
-        assert_eq!(config.working_dir, "./tmp");
-    }
-
-    #[test]
-    fn test_config_working_dir_isolation_defaults_to_chat() {
-        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\n";
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(
-            config.working_dir_isolation,
-            WorkingDirIsolation::Chat
-        ));
-    }
-
-    #[test]
-    fn test_config_working_dir_isolation_accepts_chat() {
-        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nworking_dir_isolation: chat\n";
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(
-            config.working_dir_isolation,
-            WorkingDirIsolation::Chat
-        ));
+        assert_eq!(config.workspace_dir, "./workspace");
     }
 
     #[test]
@@ -453,25 +592,18 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_and_skills_dirs_from_root_data_dir() {
+    fn test_runtime_and_skills_dirs_from_workspace_dir() {
         let mut config = test_config();
-        config.data_dir = "./microclaw.data".into();
-        assert!(config
-            .runtime_data_dir()
-            .ends_with("microclaw.data/runtime"));
-        assert!(config.skills_data_dir().ends_with("microclaw.data/skills"));
+        config.workspace_dir = "./workspace".into();
+        assert!(config.runtime_data_dir().ends_with("workspace/runtime"));
+        assert!(config.skills_data_dir().ends_with("workspace/skills"));
     }
 
     #[test]
-    fn test_runtime_and_skills_dirs_from_runtime_data_dir() {
-        let mut config = test_config();
-        config.data_dir = "./microclaw.data/runtime".into();
-        assert!(config
-            .runtime_data_dir()
-            .ends_with("microclaw.data/runtime/runtime"));
-        assert!(config
-            .skills_data_dir()
-            .ends_with("microclaw.data/runtime/skills"));
+    fn test_workspace_dir_default() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.workspace_dir, "./workspace");
     }
 
     #[test]

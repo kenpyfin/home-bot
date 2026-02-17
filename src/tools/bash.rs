@@ -4,28 +4,18 @@ use std::path::PathBuf;
 use tracing::info;
 
 use crate::claude::ToolDefinition;
-use crate::config::WorkingDirIsolation;
 use crate::tools::command_runner::{build_command, shell_command};
 
 use super::{schema_object, Tool, ToolResult};
 
 pub struct BashTool {
     working_dir: PathBuf,
-    working_dir_isolation: WorkingDirIsolation,
 }
 
 impl BashTool {
     pub fn new(working_dir: &str) -> Self {
-        Self::new_with_isolation(working_dir, WorkingDirIsolation::Shared)
-    }
-
-    pub fn new_with_isolation(
-        working_dir: &str,
-        working_dir_isolation: WorkingDirIsolation,
-    ) -> Self {
         Self {
             working_dir: PathBuf::from(working_dir),
-            working_dir_isolation,
         }
     }
 }
@@ -66,8 +56,7 @@ impl Tool for BashTool {
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(120);
-        let working_dir =
-            super::resolve_tool_working_dir(&self.working_dir, self.working_dir_isolation, &input);
+        let working_dir = super::resolve_tool_working_dir(&self.working_dir);
         if let Err(e) = tokio::fs::create_dir_all(&working_dir).await {
             return ToolResult::error(format!(
                 "Failed to create working directory {}: {e}",
@@ -199,28 +188,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[tokio::test]
-    async fn test_bash_chat_isolation_uses_chat_working_dir() {
-        let root = std::env::temp_dir().join(format!("microclaw_bash_{}", uuid::Uuid::new_v4()));
-        let work = root.join("workspace");
-        std::fs::create_dir_all(&work).unwrap();
-
-        let tool = BashTool::new_with_isolation(work.to_str().unwrap(), WorkingDirIsolation::Chat);
-        let result = tool
-            .execute(json!({
-                "command": "pwd",
-                "__microclaw_auth": {
-                    "caller_channel": "telegram",
-                    "caller_chat_id": -100123,
-                    "control_chat_ids": []
-                }
-            }))
-            .await;
-        assert!(!result.is_error);
-        assert!(result
-            .content
-            .contains("/workspace/chat/telegram/neg100123"));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
 }

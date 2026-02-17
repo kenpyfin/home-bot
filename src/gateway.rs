@@ -3,12 +3,15 @@ use crate::logging;
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::time::Duration;
 
 const LINUX_SERVICE_NAME: &str = "microclaw-gateway.service";
 const MAC_LABEL: &str = "ai.microclaw.gateway";
 const LOG_STDOUT_FILE: &str = "microclaw-gateway.log";
 const LOG_STDERR_FILE: &str = "microclaw-gateway.error.log";
 const DEFAULT_LOG_LINES: usize = 200;
+const STOP_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone)]
 struct ServiceContext {
@@ -16,6 +19,10 @@ struct ServiceContext {
     working_dir: PathBuf,
     config_path: Option<PathBuf>,
     runtime_logs_dir: PathBuf,
+    /// PATH at install time, so the service can find agent-browser, MCP commands, etc.
+    path_env: Option<String>,
+    /// HOME at install time, so config paths like ~/... resolve correctly.
+    home_env: Option<String>,
 }
 
 pub fn handle_gateway_cli(args: &[String]) -> Result<()> {
@@ -57,6 +64,10 @@ ACTIONS:
     status       Show gateway service status
     logs [N]     Show last N lines of gateway logs (default: 200)
     help         Show this message
+
+NOTE: install captures your current PATH and HOME so the service can find
+agent-browser, MCP commands, etc. If you add new executables to PATH later,
+run: microclaw gateway uninstall && microclaw gateway install
 "#
     );
 }
@@ -155,12 +166,16 @@ fn build_context() -> Result<ServiceContext> {
     let working_dir = std::env::current_dir().context("Failed to resolve current directory")?;
     let config_path = resolve_config_path(&working_dir);
     let runtime_logs_dir = resolve_runtime_logs_dir(&working_dir);
+    let path_env = std::env::var("PATH").ok().filter(|s| !s.trim().is_empty());
+    let home_env = std::env::var("HOME").ok().filter(|s| !s.trim().is_empty());
 
     Ok(ServiceContext {
         exe_path,
         working_dir,
         config_path,
         runtime_logs_dir,
+        path_env,
+        home_env,
     })
 }
 
@@ -196,6 +211,29 @@ fn run_command(cmd: &str, args: &[&str]) -> Result<std::process::Output> {
         .output()
         .with_context(|| format!("Failed to execute command: {} {}", cmd, args.join(" ")))?;
     Ok(output)
+}
+
+/// Run a command with a timeout. If it doesn't finish in time, returns an error (command may still be running).
+fn run_command_with_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<std::process::Output> {
+    let cmd_str = cmd.to_string();
+    let args_vec: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    let (tx, rx) = mpsc::channel();
+    let cmd_spawn = cmd_str.clone();
+    let args_spawn = args_vec.clone();
+    std::thread::spawn(move || {
+        let output = Command::new(&cmd_spawn).args(&args_spawn).output();
+        let _ = tx.send(output);
+    });
+    match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(anyhow!("Failed to run {} {}: {}", cmd_str, args_vec.join(" "), e)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!(
+            "Stop command did not complete within {} seconds (gateway process may be stuck). \
+            Force stop: run `pkill -9 -f microclaw` then `microclaw gateway uninstall`.",
+            timeout_secs
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!("Stop command thread exited unexpectedly")),
+    }
 }
 
 fn ensure_success(output: std::process::Output, cmd: &str, args: &[&str]) -> Result<()> {
@@ -237,6 +275,15 @@ fn render_linux_unit(ctx: &ServiceContext) -> String {
             "Environment=MICROCLAW_CONFIG={}\n",
             config_path.display()
         ));
+    }
+    // Pass install-time PATH/HOME so tools (browser, bash, MCP) find executables
+    if let Some(ref path) = ctx.path_env {
+        let safe = path.replace('\n', "").replace('"', "\\\"");
+        unit.push_str(&format!("Environment=PATH={}\n", safe));
+    }
+    if let Some(ref home) = ctx.home_env {
+        let safe = home.replace('\n', "").replace('"', "\\\"");
+        unit.push_str(&format!("Environment=HOME={}\n", safe));
     }
     unit.push_str("Restart=always\n");
     unit.push_str("RestartSec=5\n\n");
@@ -304,11 +351,12 @@ fn start_linux() -> Result<()> {
 }
 
 fn stop_linux() -> Result<()> {
-    ensure_success(
-        run_command("systemctl", &["--user", "stop", LINUX_SERVICE_NAME])?,
+    let output = run_command_with_timeout(
         "systemctl",
         &["--user", "stop", LINUX_SERVICE_NAME],
+        STOP_TIMEOUT_SECS,
     )?;
+    ensure_success(output, "systemctl", &["--user", "stop", LINUX_SERVICE_NAME])?;
     println!("Gateway service stopped");
     Ok(())
 }
@@ -391,6 +439,15 @@ fn render_macos_plist(ctx: &ServiceContext) -> String {
             "    <string>{}</string>",
             xml_escape(&config_path.to_string_lossy())
         ));
+    }
+    // Pass install-time PATH/HOME so tools (browser, bash, MCP) find executables
+    if let Some(ref path) = ctx.path_env {
+        items.push("    <key>PATH</key>".to_string());
+        items.push(format!("    <string>{}</string>", xml_escape(path)));
+    }
+    if let Some(ref home) = ctx.home_env {
+        items.push("    <key>HOME</key>".to_string());
+        items.push(format!("    <string>{}</string>", xml_escape(home)));
     }
     items.push("  </dict>".to_string());
 
@@ -477,7 +534,13 @@ fn start_macos() -> Result<()> {
 
 fn stop_macos() -> Result<()> {
     let target = mac_target_label()?;
-    let output = run_command("launchctl", &["bootout", &target])?;
+    let output = match run_command_with_timeout("launchctl", &["bootout", &target], STOP_TIMEOUT_SECS) {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("{}", e);
+            return Err(e);
+        }
+    };
     if output.status.success() {
         println!("Gateway service stopped");
         return Ok(());
@@ -493,7 +556,7 @@ fn stop_macos() -> Result<()> {
 
     Err(anyhow!(
         "Failed to stop service: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        stderr.trim()
     ))
 }
 
@@ -526,6 +589,8 @@ mod tests {
             working_dir: PathBuf::from("/tmp/microclaw"),
             config_path: Some(PathBuf::from("/tmp/microclaw/microclaw.config.yaml")),
             runtime_logs_dir: PathBuf::from("/tmp/microclaw/runtime/logs"),
+            path_env: None,
+            home_env: None,
         };
 
         let unit = render_linux_unit(&ctx);
@@ -542,6 +607,8 @@ mod tests {
             working_dir: PathBuf::from("/tmp/microclaw"),
             config_path: Some(PathBuf::from("/tmp/microclaw/microclaw.config.yaml")),
             runtime_logs_dir: PathBuf::from("/tmp/microclaw/runtime/logs"),
+            path_env: None,
+            home_env: None,
         };
 
         let plist = render_macos_plist(&ctx);

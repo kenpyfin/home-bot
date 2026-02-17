@@ -365,7 +365,7 @@ Since MicroClaw is a multi-platform bot with external dependencies (LLM APIs, Te
 | 24.2 | Webhook verification (invalid) | GET `/webhook` with wrong verify_token | Rejected |
 | 24.3 | Text message processing | Send text via WhatsApp | Bot responds |
 | 24.4 | Non-text message | Send image/audio | Silently skipped, no crash |
-| 24.5 | /reset command | Send `/reset` | Session cleared |
+| 24.5 | /reset command | Send `/reset` | Conversation cleared. Stored memory (AGENTS.md) is unchanged. |
 | 24.6 | Response splitting | Trigger long response | Split at 4096-char boundaries |
 | 24.7 | Send failure | WhatsApp API unreachable | Error logged; HTTP 200 still returned |
 

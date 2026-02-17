@@ -14,6 +14,7 @@ fn test_auth_context_control_chat() {
     let auth = ToolAuthContext {
         caller_channel: "telegram".into(),
         caller_chat_id: 100,
+        caller_persona_id: 1,
         control_chat_ids: vec![100, 200],
     };
     assert!(auth.is_control_chat());
@@ -25,6 +26,7 @@ fn test_auth_context_regular_chat() {
     let auth = ToolAuthContext {
         caller_channel: "telegram".into(),
         caller_chat_id: 300,
+        caller_persona_id: 1,
         control_chat_ids: vec![100, 200],
     };
     assert!(!auth.is_control_chat());
@@ -37,6 +39,7 @@ fn test_auth_context_empty_control_list() {
     let auth = ToolAuthContext {
         caller_channel: "telegram".into(),
         caller_chat_id: 100,
+        caller_persona_id: 0,
         control_chat_ids: vec![],
     };
     assert!(!auth.is_control_chat());

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use serde::Deserialize;
 
-use crate::config::{Config, WorkingDirIsolation};
+use crate::config::Config;
 use crate::error::MicroClawError;
 
 #[derive(Clone, Copy)]
@@ -367,9 +367,7 @@ fn default_config() -> Config {
         max_tool_iterations: 100,
         max_history_messages: 50,
         max_document_size_mb: 100,
-        data_dir: "./microclaw.data".into(),
-        working_dir: "./tmp".into(),
-        working_dir_isolation: WorkingDirIsolation::Chat,
+        workspace_dir: "./workspace".into(),
         openai_api_key: None,
         timezone: "UTC".into(),
         allowed_groups: vec![],
@@ -392,6 +390,17 @@ fn default_config() -> Config {
         web_rate_window_seconds: 10,
         web_run_history_limit: 512,
         web_session_idle_ttl_seconds: 300,
+        browser_managed: false,
+        browser_executable_path: None,
+        browser_cdp_port_base: 9222,
+        browser_idle_timeout_secs: None,
+        browser_headless: false,
+        agent_browser_path: None,
+        cursor_agent_cli_path: crate::config::default_cursor_agent_cli_path(),
+        cursor_agent_model: String::new(),
+        cursor_agent_timeout_secs: 600,
+        social: None,
+        vault: None,
     }
 }
 
@@ -485,22 +494,12 @@ pub fn run_config_wizard() -> Result<bool, MicroClawError> {
         None => return Ok(false),
     };
 
-    let data_dir = match prompt_line("Data directory", Some(&existing.data_dir), false)? {
+    let workspace_dir = match prompt_line("Workspace directory (root for runtime, skills, shared)", Some(&existing.workspace_dir), false)? {
         Some(v) => {
             if v.trim().is_empty() {
-                "./microclaw.data".to_string()
+                "./workspace".to_string()
             } else {
-                v
-            }
-        }
-        None => return Ok(false),
-    };
-    let working_dir = match prompt_line("Working directory", Some(&existing.working_dir), false)? {
-        Some(v) => {
-            if v.trim().is_empty() {
-                "./tmp".to_string()
-            } else {
-                v
+                v.trim().to_string()
             }
         }
         None => return Ok(false),
@@ -523,13 +522,12 @@ pub fn run_config_wizard() -> Result<bool, MicroClawError> {
     out.api_key = api_key;
     out.model = model;
     out.llm_base_url = llm_base_url;
-    out.data_dir = data_dir;
-    out.working_dir = working_dir;
+    out.workspace_dir = workspace_dir;
     out.timezone = timezone;
     out.post_deserialize()?;
 
-    fs::create_dir_all(&out.data_dir)?;
-    fs::create_dir_all(&out.working_dir)?;
+    fs::create_dir_all(&out.workspace_dir)?;
+    let _ = fs::create_dir_all(std::path::Path::new(&out.workspace_dir).join("shared"));
 
     let backup = save_config_yaml(&config_path, &out)?;
     println!();

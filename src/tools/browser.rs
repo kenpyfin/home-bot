@@ -11,6 +11,8 @@ use super::{auth_context_from_input, schema_object, Tool, ToolResult};
 
 pub struct BrowserTool {
     data_dir: PathBuf,
+    /// If set, use this path for the agent-browser executable; otherwise use default from PATH.
+    agent_browser_path: Option<String>,
 }
 
 fn split_browser_command(command: &str) -> Result<Vec<String>, String> {
@@ -69,9 +71,11 @@ fn split_browser_command(command: &str) -> Result<Vec<String>, String> {
 }
 
 impl BrowserTool {
-    pub fn new(data_dir: &str) -> Self {
+    /// Create a browser tool. `agent_browser_path`: optional full path to agent-browser CLI from config.
+    pub fn new(data_dir: &str, agent_browser_path: Option<String>) -> Self {
         BrowserTool {
             data_dir: PathBuf::from(data_dir).join("groups"),
+            agent_browser_path,
         }
     }
 
@@ -100,7 +104,7 @@ impl Tool for BrowserTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "browser".into(),
-            description: "Headless browser automation via agent-browser CLI. Browser state (cookies, localStorage, login sessions) persists across calls and across conversations.\n\n\
+            description: "Browser automation via the agent-browser CLI (npm package). Use this tool with a command string (e.g. open, snapshot, click, fill). Do not run agent-browser in the shell — use this tool only. Browser state (cookies, localStorage, login sessions) persists across calls.\n\n\
                 ## Basic workflow\n\
                 1. `open <url>` — navigate to a URL\n\
                 2. `snapshot -i` — get interactive elements with refs (@e1, @e2, ...)\n\
@@ -130,7 +134,7 @@ impl Tool for BrowserTool {
                 json!({
                     "command": {
                         "type": "string",
-                        "description": "The agent-browser command to run (e.g. `open https://example.com`, `snapshot -i`, `fill @e2 \"hello\"`)"
+                        "description": "The browser command to run (e.g. `open https://example.com`, `snapshot -i`, `fill @e2 \"hello\"`)"
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -154,15 +158,19 @@ impl Tool for BrowserTool {
             .unwrap_or(30);
 
         let auth = auth_context_from_input(&input);
+        let caller_chat_id = auth.as_ref().map(|a| a.caller_chat_id);
 
-        let session_name = auth
-            .as_ref()
-            .map(|auth| Self::session_name_for_chat(auth.caller_chat_id))
+        let mut args: Vec<String> = Vec::new();
+
+        let session_name = caller_chat_id
+            .map(Self::session_name_for_chat)
             .unwrap_or_else(|| "microclaw".to_string());
 
-        let mut args = vec!["--session".to_string(), session_name];
-        if let Some(auth) = auth.as_ref() {
-            let path = self.profile_path(auth.caller_chat_id);
+        args.push("--session".to_string());
+        args.push(session_name);
+
+        if let Some(chat_id) = caller_chat_id {
+            let path = self.profile_path(chat_id);
             args.push("--profile".to_string());
             args.push(path.to_string_lossy().to_string());
         }
@@ -178,12 +186,18 @@ impl Tool for BrowserTool {
         };
         args.extend(command_args);
 
-        let program = agent_browser_program();
+        let program = self
+            .agent_browser_path
+            .clone()
+            .unwrap_or_else(agent_browser_program);
         info!("Executing browser command via '{}'", program);
+
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(&args);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            tokio::process::Command::new(&program).args(&args).output(),
+            cmd.output(),
         )
         .await;
 
@@ -208,13 +222,25 @@ impl Tool for BrowserTool {
                     result_text = format!("Command completed with exit code {exit_code}");
                 }
 
+                // Detect wrong binary (microclaw-browser expects --port, not open/snapshot)
+                let wrong_binary = stderr.contains("microclaw-browser") || stderr.contains("missing --port");
+                if wrong_binary {
+                    result_text = format!(
+                        "Wrong agent-browser binary. The program at '{}' appears to be microclaw-browser (Rust), not the npm agent-browser. The browser tool requires the npm agent-browser CLI (open, snapshot, click, etc.). Fix: set agent_browser_path in microclaw.config.yaml to the npm binary, e.g. \"/opt/homebrew/bin/agent-browser\" or \"~/.local/bin/agent-browser\". Raw output:\n\n{}",
+                        program,
+                        result_text
+                    );
+                }
+
+                let is_error = exit_code != 0 || wrong_binary;
+
                 // Truncate very long output
                 if result_text.len() > 30000 {
                     result_text.truncate(30000);
                     result_text.push_str("\n... (output truncated)");
                 }
 
-                if exit_code == 0 {
+                if !is_error {
                     ToolResult::success(result_text).with_status_code(exit_code)
                 } else {
                     ToolResult::error(format!("Exit code {exit_code}\n{result_text}"))
@@ -222,8 +248,18 @@ impl Tool for BrowserTool {
                         .with_error_type("process_exit")
                 }
             }
-            Ok(Err(e)) => ToolResult::error(format!("Failed to execute agent-browser: {e}"))
-                .with_error_type("spawn_error"),
+            Ok(Err(e)) => {
+                let msg = if e.to_string().contains("No such file") || e.to_string().contains("not found") {
+                    format!(
+                        "Browser automation is not available: the command '{}' was not found. \
+                        Fix: (1) Install agent-browser: npm install -g agent-browser, then agent-browser install; (2) if the bot runs as a service or PATH doesn't include agent-browser, set agent_browser_path in microclaw.config.yaml to the full path (e.g. agent_browser_path: \"$HOME/.local/bin/agent-browser\" or agent_browser_path: \"~/.local/bin/agent-browser\"). Raw error: {e}",
+                        program
+                    )
+                } else {
+                    format!("Failed to execute browser command: {e}")
+                };
+                ToolResult::error(msg).with_error_type("spawn_error")
+            }
             Err(_) => ToolResult::error(format!(
                 "Browser command timed out after {timeout_secs} seconds"
             ))
@@ -251,11 +287,11 @@ mod tests {
 
     #[test]
     fn test_browser_tool_name_and_definition() {
-        let tool = BrowserTool::new("/tmp/test-data");
+        let tool = BrowserTool::new("/tmp/test-data", None);
         assert_eq!(tool.name(), "browser");
         let def = tool.definition();
         assert_eq!(def.name, "browser");
-        assert!(def.description.contains("agent-browser"));
+        assert!(def.description.contains("browser"));
         assert!(def.description.contains("cookies"));
         assert!(def.description.contains("eval"));
         assert!(def.description.contains("pdf"));
@@ -265,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_browser_profile_path() {
-        let tool = BrowserTool::new("/tmp/test-data");
+        let tool = BrowserTool::new("/tmp/test-data", None);
         let path = tool.profile_path(12345);
         assert_eq!(
             path,
@@ -287,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_browser_missing_command() {
-        let tool = BrowserTool::new("/tmp/test-data");
+        let tool = BrowserTool::new("/tmp/test-data", None);
         let result = tool.execute(json!({})).await;
         assert!(result.is_error);
         assert!(result.content.contains("Missing 'command'"));

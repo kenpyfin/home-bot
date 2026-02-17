@@ -47,9 +47,13 @@ impl SendMessageTool {
     }
 
     async fn store_bot_message(&self, chat_id: i64, content: String) -> Result<(), String> {
+        let persona_id = call_blocking(self.db.clone(), move |db| db.get_or_create_default_persona(chat_id))
+            .await
+            .map_err(|e| format!("Failed to resolve persona: {e}"))?;
         let msg = StoredMessage {
             id: uuid::Uuid::new_v4().to_string(),
             chat_id,
+            persona_id,
             sender_name: self.bot_username.clone(),
             content,
             is_from_bot: true,
@@ -365,11 +369,17 @@ impl Tool for SendMessageTool {
                 Err(e) => ToolResult::error(e),
             }
         } else {
+            let cid = chat_id;
+            let persona_id = match call_blocking(self.db.clone(), move |db| db.get_or_create_default_persona(cid)).await {
+                Ok(pid) => pid,
+                Err(e) => return ToolResult::error(format!("Failed to resolve persona: {e}")),
+            };
             match deliver_and_store_bot_message(
                 &self.bot,
                 self.db.clone(),
                 &self.bot_username,
                 chat_id,
+                persona_id,
                 &text,
             )
             .await
@@ -433,7 +443,8 @@ mod tests {
             .await;
         assert!(!result.is_error, "{}", result.content);
 
-        let all = db.get_all_messages(999).unwrap();
+        let pid = db.get_or_create_default_persona(999).unwrap();
+        let all = db.get_all_messages(999, pid).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].content, "hello web");
         assert!(all[0].is_from_bot);

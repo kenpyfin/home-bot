@@ -10,6 +10,7 @@ use tracing::{error, info};
 
 use crate::db::call_blocking;
 use crate::db::StoredMessage;
+use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::telegram::{AgentRequestContext, AppState};
 
 // --- Webhook query params for verification ---
@@ -139,6 +140,126 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                     None => continue,
                 };
 
+                // Use phone number as chat_id
+                let chat_id: i64 = message.from.parse().unwrap_or(0);
+                if chat_id == 0 {
+                    error!("Invalid WhatsApp phone number: {}", message.from);
+                    continue;
+                }
+
+                // Single entry point: parse slash command first. If command, run backend handler and return — never send to LLM.
+                if let Some(cmd) = parse_slash_command(&text) {
+                    match cmd {
+                        SlashCommand::Reset => {
+                            let pid = call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(chat_id)).await.unwrap_or(0);
+                            if pid > 0 {
+                                let _ = call_blocking(state.app_state.db.clone(), move |db| db.delete_session(chat_id, pid)).await;
+                            }
+                            send_whatsapp_message(
+                                &state.http_client,
+                                &state.access_token,
+                                &state.phone_number_id,
+                                &message.from,
+                                "Conversation cleared. Principles and per-persona memory are unchanged.",
+                            )
+                            .await;
+                        }
+                        SlashCommand::Skills => {
+                            let formatted = state.app_state.skills.list_skills_formatted();
+                            send_whatsapp_message(
+                                &state.http_client,
+                                &state.access_token,
+                                &state.phone_number_id,
+                                &message.from,
+                                &formatted,
+                            )
+                            .await;
+                        }
+                        SlashCommand::Persona => {
+                            let resp = crate::persona::handle_persona_command(state.app_state.db.clone(), chat_id, text.trim(), Some(&state.app_state.config)).await;
+                            send_whatsapp_message(
+                                &state.http_client,
+                                &state.access_token,
+                                &state.phone_number_id,
+                                &message.from,
+                                &resp,
+                            )
+                            .await;
+                        }
+                        SlashCommand::Schedule => {
+                            let tasks = call_blocking(state.app_state.db.clone(), move |db| db.get_tasks_for_chat(chat_id)).await;
+                            let text = match &tasks {
+                                Ok(t) => crate::tools::schedule::format_tasks_list(t),
+                                Err(e) => format!("Error listing tasks: {e}"),
+                            };
+                            send_whatsapp_message(
+                                &state.http_client,
+                                &state.access_token,
+                                &state.phone_number_id,
+                                &message.from,
+                                &text,
+                            )
+                            .await;
+                        }
+                        SlashCommand::Archive => {
+                            let pid = call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(chat_id)).await.unwrap_or(0);
+                            if pid == 0 {
+                                send_whatsapp_message(
+                                    &state.http_client,
+                                    &state.access_token,
+                                    &state.phone_number_id,
+                                    &message.from,
+                                    "No session to archive.",
+                                )
+                                .await;
+                            } else {
+                                let pid_f = pid;
+                                if let Ok(Some((json, _))) = call_blocking(state.app_state.db.clone(), move |db| {
+                                    db.load_session(chat_id, pid_f)
+                                })
+                                .await
+                                {
+                                    let messages: Vec<crate::claude::Message> = serde_json::from_str(&json).unwrap_or_default();
+                                    if messages.is_empty() {
+                                        send_whatsapp_message(
+                                            &state.http_client,
+                                            &state.access_token,
+                                            &state.phone_number_id,
+                                            &message.from,
+                                            "No session to archive.",
+                                        )
+                                        .await;
+                                    } else {
+                                        crate::telegram::archive_conversation(
+                                            &state.app_state.config.runtime_data_dir(),
+                                            chat_id,
+                                            &messages,
+                                        );
+                                        send_whatsapp_message(
+                                            &state.http_client,
+                                            &state.access_token,
+                                            &state.phone_number_id,
+                                            &message.from,
+                                            &format!("Archived {} messages.", messages.len()),
+                                        )
+                                        .await;
+                                    }
+                                } else {
+                                    send_whatsapp_message(
+                                        &state.http_client,
+                                        &state.access_token,
+                                        &state.phone_number_id,
+                                        &message.from,
+                                        "No session to archive.",
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 // Find sender name from contacts
                 let sender_name = value
                     .contacts
@@ -148,27 +269,9 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                     .and_then(|p| p.name.clone())
                     .unwrap_or_else(|| message.from.clone());
 
-                // Use phone number as chat_id
-                let chat_id: i64 = message.from.parse().unwrap_or(0);
-                if chat_id == 0 {
-                    error!("Invalid WhatsApp phone number: {}", message.from);
-                    continue;
-                }
-
-                // Handle /reset command
-                if text.trim() == "/reset" {
-                    let _ = call_blocking(state.app_state.db.clone(), move |db| {
-                        db.delete_session(chat_id)
-                    })
-                    .await;
-                    send_whatsapp_message(
-                        &state.http_client,
-                        &state.access_token,
-                        &state.phone_number_id,
-                        &message.from,
-                        "Session cleared.",
-                    )
-                    .await;
+                // Resolve persona
+                let persona_id = call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(chat_id)).await.unwrap_or(0);
+                if persona_id == 0 {
                     continue;
                 }
 
@@ -181,6 +284,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                 let stored = StoredMessage {
                     id: message.id.clone(),
                     chat_id,
+                    persona_id,
                     sender_name: sender_name.clone(),
                     content: text.clone(),
                     is_from_bot: false,
@@ -205,6 +309,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                         caller_channel: "whatsapp",
                         chat_id,
                         chat_type: "private",
+                        persona_id,
                     },
                     None,
                     None,
@@ -226,6 +331,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                             let bot_msg = StoredMessage {
                                 id: uuid::Uuid::new_v4().to_string(),
                                 chat_id,
+                                persona_id,
                                 sender_name: state.app_state.config.bot_username.clone(),
                                 content: response,
                                 is_from_bot: true,

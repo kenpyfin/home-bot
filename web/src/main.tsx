@@ -117,7 +117,6 @@ const MODEL_OPTIONS: Record<string, string[]> = {
 
 const DEFAULT_CONFIG_VALUES = {
   llm_provider: 'anthropic',
-  working_dir_isolation: 'chat',
   max_tokens: 8192,
   max_tool_iterations: 100,
   max_document_size_mb: 100,
@@ -185,19 +184,32 @@ function writeSessionToUrl(sessionKey: string): void {
   window.history.replaceState(null, '', url.toString())
 }
 
-function pickLatestSessionKey(items: SessionItem[]): string {
-  if (items.length === 0) return makeSessionKey()
+/** Stable default for web-only sessions; backend maps this to a fixed chat_id. */
+const DEFAULT_WEB_SESSION_KEY = 'main'
 
-  const parsed = items
+function getInitialSessionKey(): string {
+  if (typeof window === 'undefined') return DEFAULT_WEB_SESSION_KEY
+  const fromUrl = new URLSearchParams(window.location.search).get('session')?.trim()
+  return fromUrl || DEFAULT_WEB_SESSION_KEY
+}
+
+function pickLatestSessionKey(items: SessionItem[]): string {
+  // Prefer web sessions so we don't land the user in a Telegram (read-only) chat.
+  const webItems = items.filter((item) => item.chat_type === 'web')
+  const candidates = webItems.length > 0 ? webItems : items
+
+  if (candidates.length === 0) return DEFAULT_WEB_SESSION_KEY
+
+  const parsed = candidates
     .map((item) => ({ item, ts: Date.parse(item.last_message_time || '') }))
     .filter((v) => Number.isFinite(v.ts))
 
   if (parsed.length > 0) {
     parsed.sort((a, b) => b.ts - a.ts)
-    return parsed[0]?.item.session_key || makeSessionKey()
+    return parsed[0]?.item.session_key ?? DEFAULT_WEB_SESSION_KEY
   }
 
-  return items[items.length - 1]?.session_key || makeSessionKey()
+  return candidates[candidates.length - 1]?.session_key ?? DEFAULT_WEB_SESSION_KEY
 }
 
 if (typeof document !== 'undefined') {
@@ -506,7 +518,7 @@ function App() {
   const [uiTheme, setUiTheme] = useState<UiTheme>(readUiTheme())
   const [sessions, setSessions] = useState<SessionItem[]>([])
   const [extraSessions, setExtraSessions] = useState<SessionItem[]>([])
-  const [sessionKey, setSessionKey] = useState<string>(() => makeSessionKey())
+  const [sessionKey, setSessionKey] = useState<string>(() => getInitialSessionKey())
   const [historySeed, setHistorySeed] = useState<ThreadMessageLike[]>([])
   const [historyCountBySession, setHistoryCountBySession] = useState<Record<string, number>>({})
   const [runtimeNonce, setRuntimeNonce] = useState<number>(0)
@@ -538,10 +550,9 @@ function App() {
     }
 
     if (map.size === 0) {
-      const key = makeSessionKey()
-      map.set(key, {
-        session_key: key,
-        label: key,
+      map.set(DEFAULT_WEB_SESSION_KEY, {
+        session_key: DEFAULT_WEB_SESSION_KEY,
+        label: DEFAULT_WEB_SESSION_KEY,
         chat_id: 0,
         chat_type: 'web',
       })
@@ -604,6 +615,8 @@ function App() {
           if (!runId) {
             throw new Error('missing run_id')
           }
+
+          let receivedDone = false
 
           const query = new URLSearchParams({ run_id: runId })
           const streamResponse = await fetch(`/api/stream?${query.toString()}`, {
@@ -723,8 +736,42 @@ function App() {
             }
 
             if (event.event === 'done') {
+              receivedDone = true
+              // Command shortcuts (e.g. /persona, /reset) return full response in done only, no deltas
+              const doneResponse =
+                typeof (data as { response?: string }).response === 'string'
+                  ? (data as { response: string }).response
+                  : ''
+              if (doneResponse && assistantText.length === 0) {
+                assistantText = doneResponse
+                const content = makeContent()
+                if (content.length > 0) yield { content }
+              }
               setStatusText('Done')
               break
+            }
+          }
+
+          // If stream ended without "done" (disconnect, tab close, timeout), poll until run completes so the user sees the result without sending a follow-up message.
+          if (!receivedDone && runId) {
+            const pollIntervalMs = 2500
+            const pollMaxMs = 10 * 60 * 1000 // 10 minutes
+            const start = Date.now()
+            while (Date.now() - start < pollMaxMs) {
+              await new Promise((r) => setTimeout(r, pollIntervalMs))
+              try {
+                const status = await api<{ done?: boolean }>(
+                  `/api/run_status?run_id=${encodeURIComponent(runId)}`,
+                )
+                if (status.done === true) {
+                  setStatusText('Done')
+                  await loadHistory(sessionKey)
+                  break
+                }
+              } catch {
+                // Run not found (404) or other error — stop polling
+                break
+              }
             }
           }
         } finally {
@@ -813,7 +860,7 @@ function App() {
 
       const fallback =
         sessionItems.find((item) => item.session_key !== targetSession)?.session_key ||
-        makeSessionKey()
+        DEFAULT_WEB_SESSION_KEY
       if (targetSession === sessionKey) {
         setSessionKey(fallback)
         await loadHistory(fallback)
@@ -836,9 +883,6 @@ function App() {
       model: data.config?.model || defaultModelForProvider(String(data.config?.llm_provider || 'anthropic')),
       llm_base_url: String(data.config?.llm_base_url || ''),
       api_key: '',
-      working_dir_isolation: String(
-        data.config?.working_dir_isolation || DEFAULT_CONFIG_VALUES.working_dir_isolation,
-      ),
       max_tokens: Number(data.config?.max_tokens ?? 8192),
       max_tool_iterations: Number(data.config?.max_tool_iterations ?? 100),
       max_document_size_mb: Number(data.config?.max_document_size_mb ?? DEFAULT_CONFIG_VALUES.max_document_size_mb),
@@ -871,9 +915,6 @@ function App() {
         case 'max_tokens':
           next.max_tokens = DEFAULT_CONFIG_VALUES.max_tokens
           break
-        case 'working_dir_isolation':
-          next.working_dir_isolation = DEFAULT_CONFIG_VALUES.working_dir_isolation
-          break
         case 'max_tool_iterations':
           next.max_tool_iterations = DEFAULT_CONFIG_VALUES.max_tool_iterations
           break
@@ -904,9 +945,6 @@ function App() {
       const payload: Record<string, unknown> = {
         llm_provider: String(configDraft.llm_provider || ''),
         model: String(configDraft.model || ''),
-        working_dir_isolation: String(
-          configDraft.working_dir_isolation || DEFAULT_CONFIG_VALUES.working_dir_isolation,
-        ),
         max_tokens: Number(configDraft.max_tokens || 8192),
         max_tool_iterations: Number(configDraft.max_tool_iterations || 100),
         max_document_size_mb: Number(
@@ -1143,27 +1181,6 @@ function App() {
                     Runtime
                   </Text>
                   <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-                    <div>
-                      <Flex justify="between" align="center" mb="1">
-                        <Text size="1" color="gray">working_dir_isolation</Text>
-                        <Button size="1" variant="ghost" onClick={() => resetConfigField('working_dir_isolation')}>
-                          Reset
-                        </Button>
-                      </Flex>
-                      <Select.Root
-                        value={String(configDraft.working_dir_isolation || DEFAULT_CONFIG_VALUES.working_dir_isolation)}
-                        onValueChange={(value) => setConfigField('working_dir_isolation', value)}
-                      >
-                        <Select.Trigger placeholder="Select isolation mode" />
-                        <Select.Content>
-                          <Select.Item value="shared">shared</Select.Item>
-                          <Select.Item value="chat">chat</Select.Item>
-                        </Select.Content>
-                      </Select.Root>
-                      <Text size="1" color="gray" className="mt-1 block">
-                        shared: working_dir/shared, chat: working_dir/chat/&lt;channel&gt;/&lt;chat_id&gt;
-                      </Text>
-                    </div>
                     <div>
                       <Flex justify="between" align="center" mb="1">
                         <Text size="1" color="gray">Max tokens</Text>

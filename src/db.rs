@@ -22,10 +22,19 @@ where
 pub struct StoredMessage {
     pub id: String,
     pub chat_id: i64,
+    pub persona_id: i64,
     pub sender_name: String,
     pub content: String,
     pub is_from_bot: bool,
     pub timestamp: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Persona {
+    pub id: i64,
+    pub chat_id: i64,
+    pub name: String,
+    pub model_override: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +60,15 @@ pub struct TaskRunLog {
 }
 
 #[derive(Debug, Clone)]
+pub struct SocialOAuthToken {
+    pub platform: String,
+    pub chat_id: i64,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ScheduledTask {
     pub id: i64,
@@ -62,6 +80,21 @@ pub struct ScheduledTask {
     pub last_run: Option<String>,
     pub status: String, // "active", "paused", "completed", "cancelled"
     pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CursorAgentRun {
+    pub id: i64,
+    pub chat_id: i64,
+    pub channel: String,
+    pub prompt_preview: String,
+    pub workdir: Option<String>,
+    pub started_at: String,
+    pub finished_at: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub output_preview: Option<String>,
+    pub output_path: Option<String>,
 }
 
 impl Database {
@@ -77,21 +110,34 @@ impl Database {
                 chat_id INTEGER PRIMARY KEY,
                 chat_title TEXT,
                 chat_type TEXT NOT NULL DEFAULT 'private',
-                last_message_time TEXT NOT NULL
+                last_message_time TEXT NOT NULL,
+                active_persona_id INTEGER
             );
+
+            CREATE TABLE IF NOT EXISTS personas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                model_override TEXT,
+                UNIQUE(chat_id, name)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_personas_chat_id
+                ON personas(chat_id);
 
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT NOT NULL,
                 chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
                 sender_name TEXT NOT NULL,
                 content TEXT NOT NULL,
                 is_from_bot INTEGER NOT NULL DEFAULT 0,
                 timestamp TEXT NOT NULL,
-                PRIMARY KEY (id, chat_id)
+                PRIMARY KEY (id, chat_id, persona_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
-                ON messages(chat_id, timestamp);
+                ON messages(chat_id, persona_id, timestamp);
 
             CREATE TABLE IF NOT EXISTS scheduled_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,15 +169,175 @@ impl Database {
                 ON task_run_logs(task_id);
 
             CREATE TABLE IF NOT EXISTS sessions (
-                chat_id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
                 messages_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );",
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS social_oauth_tokens (
+                platform TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT,
+                expires_at TEXT,
+                PRIMARY KEY (platform, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_pending_states (
+                state_token TEXT PRIMARY KEY,
+                platform TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cursor_agent_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                channel TEXT NOT NULL,
+                prompt_preview TEXT NOT NULL,
+                workdir TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                exit_code INTEGER,
+                output_preview TEXT,
+                output_path TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cursor_agent_runs_chat_id
+                ON cursor_agent_runs(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_cursor_agent_runs_finished_at
+                ON cursor_agent_runs(finished_at DESC);",
         )?;
+
+        Self::migrate_persona_schema(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
         })
+    }
+
+    fn migrate_persona_schema(conn: &Connection) -> Result<(), MicroClawError> {
+        // Check if messages has persona_id (new schema)
+        let has_persona = conn
+            .prepare("PRAGMA table_info(messages)")
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                Ok(rows
+                    .filter_map(|r| r.ok())
+                    .any(|c| c == "persona_id"))
+            })
+            .unwrap_or(false);
+
+        if has_persona {
+            return Ok(());
+        }
+
+        // Add active_persona_id to chats if missing
+        let has_active = conn
+            .prepare("PRAGMA table_info(chats)")
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                Ok(rows.filter_map(|r| r.ok()).any(|c| c == "active_persona_id"))
+            })
+            .unwrap_or(false);
+        if !has_active {
+            conn.execute("ALTER TABLE chats ADD COLUMN active_persona_id INTEGER", [])?;
+        }
+
+        // Create personas table if not exists (might not exist in very old DB)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS personas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                model_override TEXT,
+                UNIQUE(chat_id, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_personas_chat_id ON personas(chat_id);",
+        )?;
+
+        // Collect all chat_ids
+        let chat_ids: Vec<i64> = {
+            let mut out = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT chat_id FROM chats UNION SELECT chat_id FROM sessions UNION SELECT chat_id FROM messages",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            for r in rows {
+                if let Ok(id) = r {
+                    if !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+            }
+            out
+        };
+
+        // Create default persona for each chat, set active
+        let now = chrono::Utc::now().to_rfc3339();
+        for cid in &chat_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO chats (chat_id, chat_title, chat_type, last_message_time, active_persona_id)
+                 VALUES (?1, NULL, 'private', ?2, NULL)",
+                params![cid, now],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO personas (chat_id, name, model_override) VALUES (?1, 'default', NULL)",
+                params![cid],
+            )?;
+            let persona_id: i64 = conn.query_row(
+                "SELECT id FROM personas WHERE chat_id = ?1 AND name = 'default'",
+                params![cid],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "UPDATE chats SET active_persona_id = ?1 WHERE chat_id = ?2",
+                params![persona_id, cid],
+            )?;
+        }
+
+        // Migrate sessions
+        conn.execute_batch(
+            "CREATE TABLE sessions_new (
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                messages_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id)
+            );
+            INSERT INTO sessions_new (chat_id, persona_id, messages_json, updated_at)
+            SELECT s.chat_id, p.id, s.messages_json, s.updated_at
+            FROM sessions s
+            JOIN personas p ON p.chat_id = s.chat_id AND p.name = 'default';
+            DROP TABLE sessions;
+            ALTER TABLE sessions_new RENAME TO sessions;",
+        )?;
+
+        // Migrate messages
+        conn.execute_batch(
+            "CREATE TABLE messages_new (
+                id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                sender_name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                is_from_bot INTEGER NOT NULL DEFAULT 0,
+                timestamp TEXT NOT NULL,
+                PRIMARY KEY (id, chat_id, persona_id)
+            );
+            CREATE INDEX idx_messages_new_chat_ts ON messages_new(chat_id, persona_id, timestamp);
+            INSERT INTO messages_new SELECT m.id, m.chat_id, p.id, m.sender_name, m.content, m.is_from_bot, m.timestamp
+            FROM messages m
+            JOIN personas p ON p.chat_id = m.chat_id AND p.name = 'default';
+            DROP TABLE messages;
+            ALTER TABLE messages_new RENAME TO messages;
+            CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp ON messages(chat_id, persona_id, timestamp);",
+        )?;
+
+        Ok(())
     }
 
     pub fn upsert_chat(
@@ -156,11 +362,12 @@ impl Database {
     pub fn store_message(&self, msg: &StoredMessage) -> Result<(), MicroClawError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, sender_name, content, is_from_bot, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO messages (id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 msg.id,
                 msg.chat_id,
+                msg.persona_id,
                 msg.sender_name,
                 msg.content,
                 msg.is_from_bot as i32,
@@ -173,26 +380,28 @@ impl Database {
     pub fn get_recent_messages(
         &self,
         chat_id: i64,
+        persona_id: i64,
         limit: usize,
     ) -> Result<Vec<StoredMessage>, MicroClawError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
+            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
              FROM messages
-             WHERE chat_id = ?1
+             WHERE chat_id = ?1 AND persona_id = ?2
              ORDER BY timestamp DESC
-             LIMIT ?2",
+             LIMIT ?3",
         )?;
 
         let messages = stmt
-            .query_map(params![chat_id, limit as i64], |row| {
+            .query_map(params![chat_id, persona_id, limit as i64], |row| {
                 Ok(StoredMessage {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
-                    sender_name: row.get(2)?,
-                    content: row.get(3)?,
-                    is_from_bot: row.get::<_, i32>(4)? != 0,
-                    timestamp: row.get(5)?,
+                    persona_id: row.get(2)?,
+                    sender_name: row.get(3)?,
+                    content: row.get(4)?,
+                    is_from_bot: row.get::<_, i32>(5)? != 0,
+                    timestamp: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -203,23 +412,28 @@ impl Database {
         Ok(messages)
     }
 
-    pub fn get_all_messages(&self, chat_id: i64) -> Result<Vec<StoredMessage>, MicroClawError> {
+    pub fn get_all_messages(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<Vec<StoredMessage>, MicroClawError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
+            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
              FROM messages
-             WHERE chat_id = ?1
+             WHERE chat_id = ?1 AND persona_id = ?2
              ORDER BY timestamp ASC",
         )?;
         let messages = stmt
-            .query_map(params![chat_id], |row| {
+            .query_map(params![chat_id, persona_id], |row| {
                 Ok(StoredMessage {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
-                    sender_name: row.get(2)?,
-                    content: row.get(3)?,
-                    is_from_bot: row.get::<_, i32>(4)? != 0,
-                    timestamp: row.get(5)?,
+                    persona_id: row.get(2)?,
+                    sender_name: row.get(3)?,
+                    content: row.get(4)?,
+                    is_from_bot: row.get::<_, i32>(5)? != 0,
+                    timestamp: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -311,11 +525,12 @@ impl Database {
         }
     }
 
-    /// Get messages since the bot's last response in this chat.
+    /// Get messages since the bot's last response in this chat/persona.
     /// Falls back to `fallback_limit` most recent messages if bot never responded.
     pub fn get_messages_since_last_bot_response(
         &self,
         chat_id: i64,
+        persona_id: i64,
         max: usize,
         fallback: usize,
     ) -> Result<Vec<StoredMessage>, MicroClawError> {
@@ -325,51 +540,53 @@ impl Database {
         let last_bot_ts: Option<String> = conn
             .query_row(
                 "SELECT timestamp FROM messages
-                 WHERE chat_id = ?1 AND is_from_bot = 1
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND is_from_bot = 1
                  ORDER BY timestamp DESC LIMIT 1",
-                params![chat_id],
+                params![chat_id, persona_id],
                 |row| row.get(0),
             )
             .ok();
 
         let mut messages = if let Some(ts) = last_bot_ts {
             let mut stmt = conn.prepare(
-                "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
+                "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
                  FROM messages
-                 WHERE chat_id = ?1 AND timestamp >= ?2
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND timestamp >= ?3
                  ORDER BY timestamp DESC
-                 LIMIT ?3",
+                 LIMIT ?4",
             )?;
             let rows = stmt
-                .query_map(params![chat_id, ts, max as i64], |row| {
+                .query_map(params![chat_id, persona_id, ts, max as i64], |row| {
                     Ok(StoredMessage {
                         id: row.get(0)?,
                         chat_id: row.get(1)?,
-                        sender_name: row.get(2)?,
-                        content: row.get(3)?,
-                        is_from_bot: row.get::<_, i32>(4)? != 0,
-                        timestamp: row.get(5)?,
+                        persona_id: row.get(2)?,
+                        sender_name: row.get(3)?,
+                        content: row.get(4)?,
+                        is_from_bot: row.get::<_, i32>(5)? != 0,
+                        timestamp: row.get(6)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
+                "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
                  FROM messages
-                 WHERE chat_id = ?1
+                 WHERE chat_id = ?1 AND persona_id = ?2
                  ORDER BY timestamp DESC
-                 LIMIT ?2",
+                 LIMIT ?3",
             )?;
             let rows = stmt
-                .query_map(params![chat_id, fallback as i64], |row| {
+                .query_map(params![chat_id, persona_id, fallback as i64], |row| {
                     Ok(StoredMessage {
                         id: row.get(0)?,
                         chat_id: row.get(1)?,
-                        sender_name: row.get(2)?,
-                        content: row.get(3)?,
-                        is_from_bot: row.get::<_, i32>(4)? != 0,
-                        timestamp: row.get(5)?,
+                        persona_id: row.get(2)?,
+                        sender_name: row.get(3)?,
+                        content: row.get(4)?,
+                        is_from_bot: row.get::<_, i32>(5)? != 0,
+                        timestamp: row.get(6)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -573,6 +790,97 @@ impl Database {
         Ok(logs)
     }
 
+    // --- Cursor agent runs ---
+
+    pub fn insert_cursor_agent_run(
+        &self,
+        chat_id: i64,
+        channel: &str,
+        prompt_preview: &str,
+        workdir: Option<&str>,
+        started_at: &str,
+        finished_at: &str,
+        success: bool,
+        exit_code: Option<i32>,
+        output_preview: Option<&str>,
+        output_path: Option<&str>,
+    ) -> Result<i64, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO cursor_agent_runs (chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                chat_id,
+                channel,
+                prompt_preview,
+                workdir,
+                started_at,
+                finished_at,
+                success as i32,
+                exit_code,
+                output_preview,
+                output_path,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get recent cursor-agent runs, optionally filtered by chat_id. Ordered by finished_at DESC.
+    pub fn get_cursor_agent_runs(
+        &self,
+        chat_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<CursorAgentRun>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let runs: Vec<CursorAgentRun> = match chat_id {
+            Some(cid) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path
+                     FROM cursor_agent_runs WHERE chat_id = ?1 ORDER BY finished_at DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![cid, limit as i64], |row| {
+                    Ok(CursorAgentRun {
+                        id: row.get(0)?,
+                        chat_id: row.get(1)?,
+                        channel: row.get(2)?,
+                        prompt_preview: row.get(3)?,
+                        workdir: row.get(4)?,
+                        started_at: row.get(5)?,
+                        finished_at: row.get(6)?,
+                        success: row.get::<_, i32>(7)? != 0,
+                        exit_code: row.get(8)?,
+                        output_preview: row.get(9)?,
+                        output_path: row.get(10)?,
+                    })
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path
+                     FROM cursor_agent_runs ORDER BY finished_at DESC LIMIT ?1",
+                )?;
+                let rows = stmt.query_map(params![limit as i64], |row| {
+                    Ok(CursorAgentRun {
+                        id: row.get(0)?,
+                        chat_id: row.get(1)?,
+                        channel: row.get(2)?,
+                        prompt_preview: row.get(3)?,
+                        workdir: row.get(4)?,
+                        started_at: row.get(5)?,
+                        finished_at: row.get(6)?,
+                        success: row.get::<_, i32>(7)? != 0,
+                        exit_code: row.get(8)?,
+                        output_preview: row.get(9)?,
+                        output_path: row.get(10)?,
+                    })
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        Ok(runs)
+    }
+
     #[allow(dead_code)]
     pub fn delete_task(&self, task_id: i64) -> Result<bool, MicroClawError> {
         let conn = self.conn.lock().unwrap();
@@ -585,25 +893,34 @@ impl Database {
 
     // --- Sessions ---
 
-    pub fn save_session(&self, chat_id: i64, messages_json: &str) -> Result<(), MicroClawError> {
+    pub fn save_session(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        messages_json: &str,
+    ) -> Result<(), MicroClawError> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO sessions (chat_id, messages_json, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(chat_id) DO UPDATE SET
-                messages_json = ?2,
-                updated_at = ?3",
-            params![chat_id, messages_json, now],
+            "INSERT INTO sessions (chat_id, persona_id, messages_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat_id, persona_id) DO UPDATE SET
+                messages_json = ?3,
+                updated_at = ?4",
+            params![chat_id, persona_id, messages_json, now],
         )?;
         Ok(())
     }
 
-    pub fn load_session(&self, chat_id: i64) -> Result<Option<(String, String)>, MicroClawError> {
+    pub fn load_session(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<Option<(String, String)>, MicroClawError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT messages_json, updated_at FROM sessions WHERE chat_id = ?1",
-            params![chat_id],
+            "SELECT messages_json, updated_at FROM sessions WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         );
         match result {
@@ -613,9 +930,12 @@ impl Database {
         }
     }
 
-    pub fn delete_session(&self, chat_id: i64) -> Result<bool, MicroClawError> {
+    pub fn delete_session(&self, chat_id: i64, persona_id: i64) -> Result<bool, MicroClawError> {
         let conn = self.conn.lock().unwrap();
-        let rows = conn.execute("DELETE FROM sessions WHERE chat_id = ?1", params![chat_id])?;
+        let rows = conn.execute(
+            "DELETE FROM sessions WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+        )?;
         Ok(rows > 0)
     }
 
@@ -624,10 +944,16 @@ impl Database {
         let tx = conn.unchecked_transaction()?;
         let mut affected = 0usize;
 
+        affected += tx.execute("UPDATE chats SET active_persona_id = NULL WHERE chat_id = ?1", params![chat_id])?;
         affected += tx.execute("DELETE FROM sessions WHERE chat_id = ?1", params![chat_id])?;
         affected += tx.execute("DELETE FROM messages WHERE chat_id = ?1", params![chat_id])?;
+        affected += tx.execute("DELETE FROM personas WHERE chat_id = ?1", params![chat_id])?;
         affected += tx.execute(
             "DELETE FROM scheduled_tasks WHERE chat_id = ?1",
+            params![chat_id],
+        )?;
+        affected += tx.execute(
+            "DELETE FROM social_oauth_tokens WHERE chat_id = ?1",
             params![chat_id],
         )?;
         affected += tx.execute("DELETE FROM chats WHERE chat_id = ?1", params![chat_id])?;
@@ -636,31 +962,330 @@ impl Database {
         Ok(affected > 0)
     }
 
+    // --- Social OAuth tokens ---
+
+    pub fn upsert_social_token(
+        &self,
+        platform: &str,
+        chat_id: i64,
+        access_token: &str,
+        refresh_token: Option<&str>,
+        expires_at: Option<&str>,
+    ) -> Result<(), MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO social_oauth_tokens (platform, chat_id, access_token, refresh_token, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(platform, chat_id) DO UPDATE SET
+                access_token = ?3,
+                refresh_token = ?4,
+                expires_at = ?5",
+            params![platform, chat_id, access_token, refresh_token, expires_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_social_token(
+        &self,
+        platform: &str,
+        chat_id: i64,
+    ) -> Result<Option<SocialOAuthToken>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT platform, chat_id, access_token, refresh_token, expires_at
+             FROM social_oauth_tokens
+             WHERE platform = ?1 AND chat_id = ?2",
+            params![platform, chat_id],
+            |row| {
+                Ok(SocialOAuthToken {
+                    platform: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    access_token: row.get(2)?,
+                    refresh_token: row.get(3)?,
+                    expires_at: row.get(4)?,
+                })
+            },
+        );
+        match result {
+            Ok(t) => Ok(Some(t)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn delete_social_token(&self, platform: &str, chat_id: i64) -> Result<bool, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM social_oauth_tokens WHERE platform = ?1 AND chat_id = ?2",
+            params![platform, chat_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    // --- OAuth pending states (short-lived mapping from state param to chat_id) ---
+
+    pub fn create_oauth_pending_state(
+        &self,
+        state_token: &str,
+        platform: &str,
+        chat_id: i64,
+        expires_at: &str,
+    ) -> Result<(), MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO oauth_pending_states (state_token, platform, chat_id, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![state_token, platform, chat_id, expires_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn consume_oauth_pending_state(
+        &self,
+        state_token: &str,
+    ) -> Result<Option<(String, i64)>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT platform, chat_id FROM oauth_pending_states
+             WHERE state_token = ?1 AND expires_at > datetime('now')",
+            params![state_token],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        );
+        let pair = match result {
+            Ok(p) => p,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        conn.execute("DELETE FROM oauth_pending_states WHERE state_token = ?1", params![state_token])?;
+        Ok(Some(pair))
+    }
+
     pub fn get_new_user_messages_since(
         &self,
         chat_id: i64,
+        persona_id: i64,
         since: &str,
     ) -> Result<Vec<StoredMessage>, MicroClawError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, sender_name, content, is_from_bot, timestamp
+            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
              FROM messages
-             WHERE chat_id = ?1 AND timestamp > ?2 AND is_from_bot = 0
+             WHERE chat_id = ?1 AND persona_id = ?2 AND timestamp > ?3 AND is_from_bot = 0
              ORDER BY timestamp ASC",
         )?;
         let messages = stmt
-            .query_map(params![chat_id, since], |row| {
+            .query_map(params![chat_id, persona_id, since], |row| {
                 Ok(StoredMessage {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
-                    sender_name: row.get(2)?,
-                    content: row.get(3)?,
-                    is_from_bot: row.get::<_, i32>(4)? != 0,
-                    timestamp: row.get(5)?,
+                    persona_id: row.get(2)?,
+                    sender_name: row.get(3)?,
+                    content: row.get(4)?,
+                    is_from_bot: row.get::<_, i32>(5)? != 0,
+                    timestamp: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
+    }
+
+    // --- Personas ---
+
+    pub fn get_or_create_default_persona(&self, chat_id: i64) -> Result<i64, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let result: Option<i64> = conn
+            .query_row(
+                "SELECT active_persona_id FROM chats WHERE chat_id = ?1",
+                params![chat_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(pid) = result {
+            if pid > 0 {
+                return Ok(pid);
+            }
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO personas (chat_id, name, model_override) VALUES (?1, 'default', NULL)",
+            params![chat_id],
+        )?;
+        let persona_id: i64 = conn.query_row(
+            "SELECT id FROM personas WHERE chat_id = ?1 AND name = 'default'",
+            params![chat_id],
+            |row| row.get(0),
+        )?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time, active_persona_id)
+             VALUES (?1, NULL, 'private', ?2, ?3)
+             ON CONFLICT(chat_id) DO UPDATE SET active_persona_id = ?3",
+            params![chat_id, now, persona_id],
+        )?;
+        Ok(persona_id)
+    }
+
+    pub fn get_active_persona_id(&self, chat_id: i64) -> Result<Option<i64>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT active_persona_id FROM chats WHERE chat_id = ?1",
+            params![chat_id],
+            |row| row.get::<_, Option<i64>>(0),
+        );
+        match result {
+            Ok(Some(pid)) if pid > 0 => Ok(Some(pid)),
+            Ok(_) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Resolve the persona to use for this run: active when set, else create/set default.
+    pub fn get_current_persona_id(&self, chat_id: i64) -> Result<i64, MicroClawError> {
+        if let Ok(Some(pid)) = self.get_active_persona_id(chat_id) {
+            return Ok(pid);
+        }
+        self.get_or_create_default_persona(chat_id)
+    }
+
+    pub fn set_active_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<bool, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE chats SET active_persona_id = ?1 WHERE chat_id = ?2",
+            params![persona_id, chat_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn list_personas(&self, chat_id: i64) -> Result<Vec<Persona>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, name, model_override FROM personas WHERE chat_id = ?1 ORDER BY id",
+        )?;
+        let personas = stmt
+            .query_map(params![chat_id], |row| {
+                Ok(Persona {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    name: row.get(2)?,
+                    model_override: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(personas)
+    }
+
+    pub fn create_persona(
+        &self,
+        chat_id: i64,
+        name: &str,
+        model_override: Option<&str>,
+    ) -> Result<i64, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO personas (chat_id, name, model_override) VALUES (?1, ?2, ?3)",
+            params![chat_id, name, model_override],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn get_persona_by_name(
+        &self,
+        chat_id: i64,
+        name: &str,
+    ) -> Result<Option<Persona>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, chat_id, name, model_override FROM personas WHERE chat_id = ?1 AND name = ?2",
+            params![chat_id, name],
+            |row| {
+                Ok(Persona {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    name: row.get(2)?,
+                    model_override: row.get(3)?,
+                })
+            },
+        );
+        match result {
+            Ok(p) => Ok(Some(p)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn get_persona(&self, id: i64) -> Result<Option<Persona>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, chat_id, name, model_override FROM personas WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(Persona {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    name: row.get(2)?,
+                    model_override: row.get(3)?,
+                })
+            },
+        );
+        match result {
+            Ok(p) => Ok(Some(p)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn delete_persona(&self, chat_id: i64, persona_id: i64) -> Result<bool, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM personas WHERE id = ?1 AND chat_id = ?2",
+                params![persona_id, chat_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| MicroClawError::ToolExecution("Persona not found".into()))?;
+        if name == "default" {
+            return Err(MicroClawError::ToolExecution(
+                "Cannot delete the default persona".into(),
+            ));
+        }
+        let tx = conn.unchecked_transaction()?;
+        let _ = tx.execute(
+            "DELETE FROM sessions WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+        )?;
+        let _ = tx.execute(
+            "DELETE FROM messages WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+        )?;
+        let rows = tx.execute(
+            "DELETE FROM personas WHERE id = ?1 AND chat_id = ?2",
+            params![persona_id, chat_id],
+        )?;
+        tx.execute(
+            "UPDATE chats SET active_persona_id = (SELECT id FROM personas WHERE chat_id = ?1 AND name = 'default' LIMIT 1) WHERE chat_id = ?1 AND active_persona_id = ?2",
+            params![chat_id, persona_id],
+        )?;
+        tx.commit()?;
+        Ok(rows > 0)
+    }
+
+    pub fn update_persona_model(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        model_override: Option<&str>,
+    ) -> Result<bool, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE personas SET model_override = ?1 WHERE id = ?2 AND chat_id = ?3",
+            params![model_override, persona_id, chat_id],
+        )?;
+        Ok(rows > 0)
     }
 }
 
@@ -678,11 +1303,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn test_persona(db: &Database, chat_id: i64) -> i64 {
+        db.upsert_chat(chat_id, None, "private").unwrap();
+        db.get_or_create_default_persona(chat_id).unwrap()
+    }
+
     #[test]
     fn test_new_database_creates_tables() {
         let (db, dir) = test_db();
-        // Verify we can do basic operations without errors
-        let msgs = db.get_recent_messages(1, 10).unwrap();
+        let pid = test_persona(&db, 1);
+        let msgs = db.get_recent_messages(1, pid, 10).unwrap();
         assert!(msgs.is_empty());
         let tasks = db.get_due_tasks("2099-01-01T00:00:00Z").unwrap();
         assert!(tasks.is_empty());
@@ -703,9 +1333,11 @@ mod tests {
     #[test]
     fn test_store_and_retrieve_message() {
         let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
         let msg = StoredMessage {
             id: "msg1".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "alice".into(),
             content: "hello".into(),
             is_from_bot: false,
@@ -713,7 +1345,7 @@ mod tests {
         };
         db.store_message(&msg).unwrap();
 
-        let messages = db.get_recent_messages(100, 10).unwrap();
+        let messages = db.get_recent_messages(100, pid, 10).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, "msg1");
         assert_eq!(messages[0].sender_name, "alice");
@@ -725,9 +1357,11 @@ mod tests {
     #[test]
     fn test_store_message_upsert() {
         let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
         let msg = StoredMessage {
             id: "msg1".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "alice".into(),
             content: "original".into(),
             is_from_bot: false,
@@ -739,6 +1373,7 @@ mod tests {
         let msg2 = StoredMessage {
             id: "msg1".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "alice".into(),
             content: "updated".into(),
             is_from_bot: false,
@@ -746,7 +1381,7 @@ mod tests {
         };
         db.store_message(&msg2).unwrap();
 
-        let messages = db.get_recent_messages(100, 10).unwrap();
+        let messages = db.get_recent_messages(100, pid, 10).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "updated");
         cleanup(&dir);
@@ -755,10 +1390,12 @@ mod tests {
     #[test]
     fn test_get_recent_messages_ordering_and_limit() {
         let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
         for i in 0..5 {
             let msg = StoredMessage {
                 id: format!("msg{i}"),
                 chat_id: 100,
+                persona_id: pid,
                 sender_name: "alice".into(),
                 content: format!("message {i}"),
                 is_from_bot: false,
@@ -768,14 +1405,15 @@ mod tests {
         }
 
         // Limit to 3 - should get the 3 most recent, but reversed to oldest-first
-        let messages = db.get_recent_messages(100, 3).unwrap();
+        let messages = db.get_recent_messages(100, pid, 3).unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].content, "message 2"); // oldest of the 3 most recent
         assert_eq!(messages[1].content, "message 3");
         assert_eq!(messages[2].content, "message 4"); // most recent
 
         // Different chat_id should be empty
-        let messages = db.get_recent_messages(200, 10).unwrap();
+        let pid2 = test_persona(&db, 200);
+        let messages = db.get_recent_messages(200, pid2, 10).unwrap();
         assert!(messages.is_empty());
         cleanup(&dir);
     }
@@ -783,11 +1421,13 @@ mod tests {
     #[test]
     fn test_get_messages_since_last_bot_response_with_bot_msg() {
         let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
 
         // User message 1
         db.store_message(&StoredMessage {
             id: "m1".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "alice".into(),
             content: "hi".into(),
             is_from_bot: false,
@@ -799,6 +1439,7 @@ mod tests {
         db.store_message(&StoredMessage {
             id: "m2".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "bot".into(),
             content: "hello!".into(),
             is_from_bot: true,
@@ -810,6 +1451,7 @@ mod tests {
         db.store_message(&StoredMessage {
             id: "m3".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "alice".into(),
             content: "how are you?".into(),
             is_from_bot: false,
@@ -821,6 +1463,7 @@ mod tests {
         db.store_message(&StoredMessage {
             id: "m4".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "bob".into(),
             content: "me too".into(),
             is_from_bot: false,
@@ -829,7 +1472,7 @@ mod tests {
         .unwrap();
 
         let messages = db
-            .get_messages_since_last_bot_response(100, 50, 10)
+            .get_messages_since_last_bot_response(100, pid, 50, 10)
             .unwrap();
         // Should include the bot message and everything after it
         assert!(messages.len() >= 2);
@@ -843,11 +1486,13 @@ mod tests {
     #[test]
     fn test_get_messages_since_last_bot_response_no_bot_msg() {
         let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
 
         for i in 0..5 {
             db.store_message(&StoredMessage {
                 id: format!("m{i}"),
                 chat_id: 100,
+                persona_id: pid,
                 sender_name: "alice".into(),
                 content: format!("msg {i}"),
                 is_from_bot: false,
@@ -857,7 +1502,7 @@ mod tests {
         }
 
         // Fallback to last 3
-        let messages = db.get_messages_since_last_bot_response(100, 50, 3).unwrap();
+        let messages = db.get_messages_since_last_bot_response(100, pid, 50, 3).unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].content, "msg 2");
         assert_eq!(messages[2].content, "msg 4");
@@ -1021,10 +1666,12 @@ mod tests {
     #[test]
     fn test_get_all_messages() {
         let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
         for i in 0..5 {
             db.store_message(&StoredMessage {
                 id: format!("msg{i}"),
                 chat_id: 100,
+                persona_id: pid,
                 sender_name: "alice".into(),
                 content: format!("message {i}"),
                 is_from_bot: false,
@@ -1033,13 +1680,14 @@ mod tests {
             .unwrap();
         }
 
-        let messages = db.get_all_messages(100).unwrap();
+        let messages = db.get_all_messages(100, pid).unwrap();
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[0].content, "message 0");
         assert_eq!(messages[4].content, "message 4");
 
         // Different chat should be empty
-        assert!(db.get_all_messages(200).unwrap().is_empty());
+        let pid2 = test_persona(&db, 200);
+        assert!(db.get_all_messages(200, pid2).unwrap().is_empty());
         cleanup(&dir);
     }
 
@@ -1103,10 +1751,11 @@ mod tests {
     #[test]
     fn test_save_and_load_session() {
         let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
         let json = r#"[{"role":"user","content":"hello"}]"#;
-        db.save_session(100, json).unwrap();
+        db.save_session(100, pid, json).unwrap();
 
-        let result = db.load_session(100).unwrap();
+        let result = db.load_session(100, pid).unwrap();
         assert!(result.is_some());
         let (loaded_json, updated_at) = result.unwrap();
         assert_eq!(loaded_json, json);
@@ -1114,8 +1763,8 @@ mod tests {
 
         // Upsert: save again with different data
         let json2 = r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#;
-        db.save_session(100, json2).unwrap();
-        let (loaded_json2, _) = db.load_session(100).unwrap().unwrap();
+        db.save_session(100, pid, json2).unwrap();
+        let (loaded_json2, _) = db.load_session(100, pid).unwrap().unwrap();
         assert_eq!(loaded_json2, json2);
 
         cleanup(&dir);
@@ -1124,7 +1773,8 @@ mod tests {
     #[test]
     fn test_load_session_nonexistent() {
         let (db, dir) = test_db();
-        let result = db.load_session(999).unwrap();
+        let pid = test_persona(&db, 999);
+        let result = db.load_session(999, pid).unwrap();
         assert!(result.is_none());
         cleanup(&dir);
     }
@@ -1132,22 +1782,25 @@ mod tests {
     #[test]
     fn test_delete_session() {
         let (db, dir) = test_db();
-        db.save_session(100, "[]").unwrap();
-        assert!(db.delete_session(100).unwrap());
-        assert!(db.load_session(100).unwrap().is_none());
+        let pid = test_persona(&db, 100);
+        db.save_session(100, pid, "[]").unwrap();
+        assert!(db.delete_session(100, pid).unwrap());
+        assert!(db.load_session(100, pid).unwrap().is_none());
         // Delete again returns false
-        assert!(!db.delete_session(100).unwrap());
+        assert!(!db.delete_session(100, pid).unwrap());
         cleanup(&dir);
     }
 
     #[test]
     fn test_get_new_user_messages_since() {
         let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
 
         // Messages before the cutoff
         db.store_message(&StoredMessage {
             id: "m1".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "alice".into(),
             content: "old msg".into(),
             is_from_bot: false,
@@ -1159,6 +1812,7 @@ mod tests {
         db.store_message(&StoredMessage {
             id: "m2".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "bot".into(),
             content: "response".into(),
             is_from_bot: true,
@@ -1170,6 +1824,7 @@ mod tests {
         db.store_message(&StoredMessage {
             id: "m3".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "alice".into(),
             content: "new msg 1".into(),
             is_from_bot: false,
@@ -1180,6 +1835,7 @@ mod tests {
         db.store_message(&StoredMessage {
             id: "m4".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "bob".into(),
             content: "new msg 2".into(),
             is_from_bot: false,
@@ -1191,6 +1847,7 @@ mod tests {
         db.store_message(&StoredMessage {
             id: "m5".into(),
             chat_id: 100,
+            persona_id: pid,
             sender_name: "bot".into(),
             content: "bot again".into(),
             is_from_bot: true,
@@ -1199,7 +1856,7 @@ mod tests {
         .unwrap();
 
         let msgs = db
-            .get_new_user_messages_since(100, "2024-01-01T00:00:02Z")
+            .get_new_user_messages_since(100, pid, "2024-01-01T00:00:02Z")
             .unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "new msg 1");

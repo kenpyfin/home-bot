@@ -1,3 +1,4 @@
+use microclaw::claude::{Message, MessageContent};
 use microclaw::config::Config;
 use microclaw::error::MicroClawError;
 use microclaw::{
@@ -21,6 +22,7 @@ COMMANDS:
     gateway     Manage gateway service (install/uninstall/start/stop/status/logs)
     config      Run interactive Q&A config flow (recommended)
     doctor      Run preflight diagnostics (cross-platform)
+    test-llm [--with-tools]   Test LLM connection (use --with-tools to send tools like Telegram)
     setup       Run interactive setup wizard
     version     Show version information
     help        Show this help message
@@ -64,9 +66,7 @@ CONFIG FILE (microclaw.config.yaml):
       llm_base_url           Custom base URL (optional)
 
     Runtime:
-      data_dir               Data root (runtime in ./microclaw.data/runtime, skills in ./microclaw.data/skills)
-      working_dir            Default tool working directory (default: ./tmp)
-      working_dir_isolation  Tool working-dir mode: shared or chat (default: chat)
+      workspace_dir          Workspace root (default: ./workspace). Layout: runtime/, skills/, shared/ under this path. Copy to migrate.
       max_tokens             Max tokens per response (default: 8192)
       max_tool_iterations    Max tool loop iterations (default: 100)
       max_history_messages   Chat history context size (default: 50)
@@ -89,7 +89,7 @@ CONFIG FILE (microclaw.config.yaml):
       discord_allowed_channels    List of channel IDs to respond in (empty = all)
 
 MCP (optional):
-    Place a mcp.json file in data_dir (default: ./microclaw.data) to connect MCP servers.
+    Place a mcp.json file in workspace_dir to connect MCP servers.
     See https://modelcontextprotocol.io for details.
 
 EXAMPLES:
@@ -100,6 +100,8 @@ EXAMPLES:
     microclaw config              Run interactive Q&A config flow
     microclaw doctor              Run preflight diagnostics
     microclaw doctor --json       Output diagnostics as JSON
+    microclaw test-llm            Test LLM API connection (no tools)
+    microclaw test-llm --with-tools   Test LLM with full tool list (like Telegram)
     microclaw setup               Run full-screen setup wizard
     microclaw version             Show version
     microclaw help                Show this message
@@ -111,6 +113,78 @@ ABOUT:
 
 fn print_version() {
     println!("microclaw {VERSION}");
+}
+
+async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(MicroClawError::Config(e)) => {
+            eprintln!("Config error: {e}");
+            eprintln!("Set MICROCLAW_CONFIG or create microclaw.config.yaml");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Failed to load config: {e}");
+            std::process::exit(1);
+        }
+    };
+    let provider = microclaw::llm::create_provider(&config);
+    let messages = vec![Message {
+        role: "user".into(),
+        content: MessageContent::Text("Reply with exactly: OK".into()),
+    }];
+    let tools_arg = if with_tools {
+        let runtime_data_dir = config.runtime_data_dir();
+        let db = match db::Database::new(&runtime_data_dir) {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => {
+                eprintln!("Database init failed (needed for --with-tools): {e}");
+                std::process::exit(1);
+            }
+        };
+        let token = if config.telegram_bot_token.is_empty() {
+            "dummy"
+        } else {
+            &config.telegram_bot_token
+        };
+        let bot = teloxide::Bot::new(token);
+        let tools = microclaw::tools::ToolRegistry::new(&config, bot, db.clone());
+        let defs = tools.definitions();
+        println!("Testing with {} tools (same as Telegram).", defs.len());
+        Some(defs)
+    } else {
+        None
+    };
+    println!(
+        "Testing LLM: provider={} model={} base={}{}",
+        config.llm_provider,
+        config.model,
+        config.llm_base_url.as_deref().unwrap_or("(default)"),
+        if with_tools { " (with tools)" } else { "" }
+    );
+    match provider
+        .send_message("You are a test assistant.", messages, tools_arg)
+        .await
+    {
+        Ok(resp) => {
+            let text = resp
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    microclaw::claude::ResponseContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            let usage = resp.usage.as_ref().map(|u| format!(" (input: {} output: {} tokens)", u.input_tokens, u.output_tokens)).unwrap_or_default();
+            println!("LLM OK. Response: {}{}", text.trim(), usage);
+        }
+        Err(e) => {
+            eprintln!("LLM error: {e}");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
 }
 
 fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -138,10 +212,136 @@ fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Ensure workspace shared directory exists under the data root (for unified layout).
+fn ensure_workspace_shared_dir(data_root: &Path) {
+    let shared = data_root.join("shared");
+    if std::fs::create_dir_all(&shared).is_err() {
+        tracing::warn!("Failed to create workspace shared dir: {}", shared.display());
+    }
+}
+
+/// If repo-root shared/ exists, copy its contents into workspace shared dir so the canonical workspace has all shared content. Does not overwrite existing files.
+fn migrate_repo_shared_into_workspace(working_dir: &Path) {
+    let workspace_shared = working_dir.join("shared");
+    if std::fs::create_dir_all(&workspace_shared).is_err() {
+        return;
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let repo_shared = cwd.join("shared");
+    if !repo_shared.is_dir() {
+        return;
+    }
+    let entries = match std::fs::read_dir(&repo_shared) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let src = entry.path();
+        let dst = workspace_shared.join(name_str);
+        if dst.exists() {
+            continue;
+        }
+        if src.is_dir() {
+            if copy_dir_all(&src, &dst).is_err() {
+                tracing::warn!(
+                    "Failed to copy repo shared dir '{}' -> '{}'",
+                    src.display(),
+                    dst.display()
+                );
+            } else {
+                tracing::info!(
+                    "Migrated repo shared '{}' -> '{}'",
+                    src.display(),
+                    dst.display()
+                );
+            }
+        } else if std::fs::copy(&src, &dst).is_err() {
+            tracing::warn!(
+                "Failed to copy repo shared file '{}' -> '{}'",
+                src.display(),
+                dst.display()
+            );
+        } else {
+            tracing::info!(
+                "Migrated repo shared '{}' -> '{}'",
+                src.display(),
+                dst.display()
+            );
+        }
+    }
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let child_src = entry.path();
+        let child_dst = dst.join(entry.file_name());
+        if child_src.is_dir() {
+            copy_dir_all(&child_src, &child_dst)?;
+        } else {
+            std::fs::copy(&child_src, &child_dst)?;
+        }
+    }
+    Ok(())
+}
+
+/// Ensure AGENTS.md lives at workspace_root/AGENTS.md (canonical). Move from runtime/groups/ or
+/// runtime/ if needed. If both old and new exist, workspace root wins; remove stale copies.
+fn migrate_agents_md_to_workspace_root(workspace_root: &Path, runtime_dir: &Path) {
+    let new_path = workspace_root.join("AGENTS.md");
+    let legacy_locations = [
+        runtime_dir.join("groups").join("AGENTS.md"),
+        runtime_dir.join("AGENTS.md"),
+    ];
+    for old_path in &legacy_locations {
+        if !old_path.exists() {
+            continue;
+        }
+        if new_path.exists() {
+            // Root already has canonical copy; remove stale
+            if let Err(e) = std::fs::remove_file(old_path) {
+                tracing::warn!(
+                    "Failed to remove stale AGENTS.md at '{}': {}",
+                    old_path.display(),
+                    e
+                );
+            } else {
+                tracing::info!(
+                    "Removed stale AGENTS.md at {} (canonical is workspace root)",
+                    old_path.display()
+                );
+            }
+        } else {
+            if let Err(e) = std::fs::rename(old_path, &new_path) {
+                tracing::warn!(
+                    "Failed to migrate AGENTS.md '{}' -> '{}': {}",
+                    old_path.display(),
+                    new_path.display(),
+                    e
+                );
+            } else {
+                tracing::info!(
+                    "Migrated AGENTS.md to workspace root: {}",
+                    new_path.display()
+                );
+            }
+            break; // moved, done
+        }
+    }
+}
+
 fn migrate_legacy_runtime_layout(data_root: &Path, runtime_dir: &Path) {
     if std::fs::create_dir_all(runtime_dir).is_err() {
         return;
     }
+    ensure_workspace_shared_dir(data_root);
 
     let entries = match std::fs::read_dir(data_root) {
         Ok(entries) => entries,
@@ -153,7 +353,7 @@ fn migrate_legacy_runtime_layout(data_root: &Path, runtime_dir: &Path) {
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        if name_str == "skills" || name_str == "runtime" || name_str == "mcp.json" {
+        if name_str == "skills" || name_str == "runtime" || name_str == "shared" || name_str == "mcp.json" {
             continue;
         }
         let src = entry.path();
@@ -211,6 +411,11 @@ async fn main() -> anyhow::Result<()> {
             doctor::run_cli(&args[2..])?;
             return Ok(());
         }
+        Some("test-llm") => {
+            let with_tools = args.get(2).map(|s| s.as_str()) == Some("--with-tools");
+            run_test_llm(with_tools).await?;
+            return Ok(());
+        }
         Some("version" | "--version" | "-V") => {
             print_version();
             return Ok(());
@@ -247,6 +452,8 @@ async fn main() -> anyhow::Result<()> {
     let runtime_data_dir = config.runtime_data_dir();
     let skills_data_dir = config.skills_data_dir();
     migrate_legacy_runtime_layout(&data_root_dir, Path::new(&runtime_data_dir));
+    migrate_repo_shared_into_workspace(Path::new(config.working_dir()));
+    migrate_agents_md_to_workspace_root(Path::new(config.working_dir()), Path::new(&runtime_data_dir));
     builtin_skills::ensure_builtin_skills(&data_root_dir)?;
 
     if std::env::var("MICROCLAW_GATEWAY").is_ok() {
@@ -258,7 +465,12 @@ async fn main() -> anyhow::Result<()> {
     let db = db::Database::new(&runtime_data_dir)?;
     info!("Database initialized");
 
-    let memory_manager = memory::MemoryManager::new(&runtime_data_dir);
+    let principles_path = config.vault.as_ref().and_then(|v| v.principles_path.clone());
+    let memory_manager = memory::MemoryManager::with_principles_path(
+        &runtime_data_dir,
+        config.working_dir(),
+        principles_path,
+    );
     info!("Memory manager initialized");
 
     let skill_manager = skills::SkillManager::from_skills_dir(&skills_data_dir);
@@ -276,11 +488,8 @@ async fn main() -> anyhow::Result<()> {
         info!("MCP initialized: {} tools available", mcp_tool_count);
     }
 
-    let mut runtime_config = config.clone();
-    runtime_config.data_dir = runtime_data_dir;
-
     telegram::run_bot(
-        runtime_config,
+        config,
         db,
         memory_manager,
         skill_manager,
