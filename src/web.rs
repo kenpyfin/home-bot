@@ -1857,6 +1857,7 @@ mod tests {
             cursor_agent_model: String::new(),
             cursor_agent_timeout_secs: 600,
             social: None,
+            vault: None,
         };
         let dir = std::env::temp_dir().join(format!("microclaw_webtest_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();

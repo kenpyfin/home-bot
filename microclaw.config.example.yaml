@@ -100,3 +100,13 @@ web_session_idle_ttl_seconds: 300
 #   linkedin:
 #     client_id: ""
 #     client_secret: ""
+
+# ORIGIN Obsidian vault / vector DB (optional). Paths are relative to workspace_dir.
+# When set, these values are injected into the system prompt so the bot knows vault paths.
+# vault:
+#   origin_vault_path: "shared/ORIGIN"
+#   vector_db_path: "shared/vault_db"
+#   embedding_server_url: "http://127.0.0.1:8080"
+#   vault_search_command: 'python3 query_vault.py "{query}"'
+#   vault_index_command: "python3 index_vault.py"
+#   principles_path: "AGENTS.md"   # override if principles live inside vault (e.g. "shared/ORIGIN/AGENTS.md")

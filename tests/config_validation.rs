@@ -48,6 +48,7 @@ fn minimal_config() -> Config {
         cursor_agent_model: String::new(),
         cursor_agent_timeout_secs: 600,
         social: None,
+        vault: None,
     }
 }
 

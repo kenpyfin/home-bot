@@ -121,6 +121,30 @@ pub struct SocialConfig {
     pub linkedin: SocialPlatformConfig,
 }
 
+/// Optional vault/vector DB config for ORIGIN Obsidian vault integration.
+/// Paths are relative to workspace_dir unless absolute.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VaultConfig {
+    /// ORIGIN vault path relative to workspace_dir (e.g. "shared/ORIGIN").
+    #[serde(default)]
+    pub origin_vault_path: Option<String>,
+    /// ChromaDB persistence dir relative to workspace_dir (e.g. "shared/vault_db").
+    #[serde(default)]
+    pub vector_db_path: Option<String>,
+    /// Embedding server URL (e.g. "http://10.0.1.211:8080" for llama.cpp).
+    #[serde(default)]
+    pub embedding_server_url: Option<String>,
+    /// Search command; use "{query}" as placeholder for the query.
+    #[serde(default)]
+    pub vault_search_command: Option<String>,
+    /// Index command to run after vault updates.
+    #[serde(default)]
+    pub vault_index_command: Option<String>,
+    /// Override principles file path relative to workspace_dir (e.g. "shared/ORIGIN/AGENTS.md"). Default: "AGENTS.md" at workspace root.
+    #[serde(default)]
+    pub principles_path: Option<String>,
+}
+
 impl SocialConfig {
     pub fn is_platform_enabled(&self, platform: &str) -> bool {
         let (id, secret) = match platform {
@@ -236,6 +260,9 @@ pub struct Config {
     pub cursor_agent_timeout_secs: u64,
     #[serde(default)]
     pub social: Option<SocialConfig>,
+    /// Optional vault/vector DB config for ORIGIN Obsidian vault integration.
+    #[serde(default)]
+    pub vault: Option<VaultConfig>,
 }
 
 impl Config {
@@ -267,15 +294,19 @@ impl Config {
 
     /// Absolute path to the skills directory. Use this in the system prompt so the bot writes skill files to the real skills dir (file tools resolve relative paths from workspace_dir/shared).
     pub fn skills_data_dir_absolute(&self) -> std::path::PathBuf {
+        self.workspace_root_absolute().join("skills")
+    }
+
+    /// Absolute path to the workspace root (workspace_dir resolved to absolute).
+    pub fn workspace_root_absolute(&self) -> std::path::PathBuf {
         let root = PathBuf::from(&self.workspace_dir);
-        let root_abs = if root.is_absolute() {
+        if root.is_absolute() {
             root
         } else {
             std::env::current_dir()
                 .unwrap_or_else(|_| root.clone())
                 .join(&self.workspace_dir)
-        };
-        root_abs.join("skills")
+        }
     }
 
     pub fn resolve_config_path() -> Result<Option<PathBuf>, MicroClawError> {
@@ -481,6 +512,7 @@ mod tests {
             cursor_agent_model: String::new(),
             cursor_agent_timeout_secs: 600,
             social: None,
+            vault: None,
         }
     }
 

@@ -1,0 +1,43 @@
+services:
+  microclaw:
+    build: .
+    container_name: microclaw
+    volumes:
+      - ./microclaw.config.yaml:/app/microclaw.config.yaml:ro
+      - ./tmp:/app/tmp
+    environment:
+      - MICROCLAW_CONFIG=/app/microclaw.config.yaml
+    ports:
+      - "10961:10961"
+    shm_size: "1gb"
+    restart: unless-stopped
+
+  # Optional: sync ORIGIN vault from git every 15 minutes.
+  # Set ORIGIN_VAULT_REPO in .env to enable. Run: docker compose --profile sync up -d
+  sync:
+    image: alpine:3.19
+    container_name: microclaw-sync
+    working_dir: /app
+    volumes:
+      - ./tmp:/app/tmp
+    environment:
+      - ORIGIN_VAULT_PATH=/app/tmp/shared/ORIGIN
+      - ORIGIN_VAULT_REPO=${ORIGIN_VAULT_REPO:-}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache git
+        VAULT="$${ORIGIN_VAULT_PATH:-/app/tmp/shared/ORIGIN}"
+        while true; do
+          if [ -n "$${ORIGIN_VAULT_REPO}" ]; then
+            if [ ! -d "$$VAULT/.git" ]; then
+              mkdir -p "$$(dirname "$$VAULT")"
+              git clone "$$ORIGIN_VAULT_REPO" "$$VAULT" 2>/dev/null || true
+            else
+              (cd "$$VAULT" && git pull --rebase) 2>/dev/null || true
+            fi
+          fi
+          sleep 900
+        done
+    profiles:
+      - sync

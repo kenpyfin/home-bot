@@ -709,6 +709,45 @@ pub async fn process_with_agent_with_events(
     });
     // Use absolute skills path so the bot writes to the real skills dir; file tools resolve relative paths from workspace_dir/shared.
     let skills_dir_for_prompt = state.config.skills_data_dir_absolute().to_string_lossy().to_string();
+    // Build vault paths section when vault config is set (injected into system prompt).
+    let vault_paths_section = state.config.vault.as_ref().and_then(|v| {
+        let root = state.config.workspace_root_absolute().to_string_lossy().to_string();
+        let mut parts = Vec::new();
+        if let Some(ref p) = v.origin_vault_path {
+            if !p.trim().is_empty() {
+                parts.push(format!("- ORIGIN vault: {}/{}", root, p.trim().trim_start_matches('/')));
+            }
+        }
+        if let Some(ref p) = v.vector_db_path {
+            if !p.trim().is_empty() {
+                parts.push(format!("- Vector DB (ChromaDB): {}/{}", root, p.trim().trim_start_matches('/')));
+            }
+        }
+        if let Some(ref u) = v.embedding_server_url {
+            if !u.trim().is_empty() {
+                parts.push(format!("- Embedding server: {}", u.trim()));
+            }
+        }
+        if let Some(ref c) = v.vault_search_command {
+            if !c.trim().is_empty() {
+                parts.push(format!("- Search: {}", c.trim()));
+            }
+        }
+        if let Some(ref c) = v.vault_index_command {
+            if !c.trim().is_empty() {
+                parts.push(format!("- Index: {}", c.trim()));
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            parts.push(format!("- Skills directory: {}", skills_dir_for_prompt));
+            Some(format!(
+                "\n# Vault and Vector DB Paths\n\n{}\n\n",
+                parts.join("\n")
+            ))
+        }
+    });
     let system_prompt = build_system_prompt(
         &state.config.bot_username,
         &principles_content,
@@ -721,6 +760,7 @@ pub async fn process_with_agent_with_events(
         &workspace_path,
         &skills_dir_for_prompt,
         social_feed_note.as_deref(),
+        vault_paths_section.as_deref(),
     );
 
     // Try to resume from session
@@ -1085,6 +1125,7 @@ fn build_system_prompt(
     workspace_path: &str,
     skills_dir_display: &str,
     social_feed_note: Option<&str>,
+    vault_paths_section: Option<&str>,
 ) -> String {
     let mut caps = format!(
         r#"- Execute bash commands
@@ -1162,6 +1203,10 @@ Be concise and helpful. When executing commands or tools, show the relevant resu
         prompt.push_str("\n# Workspace\n\nThe following workspace documentation is loaded so you are aware of tools and rules from previous sessions:\n\n");
         prompt.push_str(workspace_context);
         prompt.push_str("\n\n");
+    }
+
+    if let Some(section) = vault_paths_section {
+        prompt.push_str(section);
     }
 
     if !skills_catalog.is_empty() {
@@ -1866,7 +1911,7 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_basic() {
-        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None);
+        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None, None);
         assert!(prompt.contains("testbot"));
         assert!(prompt.contains("12345"));
         assert!(prompt.contains("bash commands"));
@@ -1877,7 +1922,7 @@ mod tests {
     #[test]
     fn test_build_system_prompt_with_memory() {
         let principles = "User likes Rust";
-        let prompt = build_system_prompt("testbot", principles, "microclaw.data/AGENTS.md", "", 42, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None);
+        let prompt = build_system_prompt("testbot", principles, "microclaw.data/AGENTS.md", "", 42, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None, None);
         assert!(prompt.contains("# Principles"));
         assert!(prompt.contains("microclaw.data/AGENTS.md"));
         assert!(prompt.contains("User likes Rust"));
@@ -1886,7 +1931,7 @@ mod tests {
     #[test]
     fn test_build_system_prompt_with_skills() {
         let catalog = "<available_skills>\n- pdf: Convert to PDF\n</available_skills>";
-        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 42, 1, catalog, "", "./tmp/shared", "./microclaw.data/skills", None);
+        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 42, 1, catalog, "", "./tmp/shared", "./microclaw.data/skills", None, None);
         assert!(prompt.contains("# Agent Skills"));
         assert!(prompt.contains("activate_skill"));
         assert!(prompt.contains("pdf: Convert to PDF"));
@@ -1894,14 +1939,14 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_without_skills() {
-        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 42, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None);
+        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 42, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None, None);
         assert!(!prompt.contains("# Agent Skills"));
     }
 
     #[test]
     fn test_build_system_prompt_with_workspace_context() {
         let ws = "## WORKSPACE.md\n\nWe have email_tool.py and query_vault.py.";
-        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 42, 1, "", ws, "./tmp/shared", "./microclaw.data/skills", None);
+        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 42, 1, "", ws, "./tmp/shared", "./microclaw.data/skills", None, None);
         assert!(prompt.contains("# Workspace"));
         assert!(prompt.contains("email_tool.py"));
         assert!(prompt.contains("query_vault.py"));
@@ -1909,7 +1954,7 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_includes_workspace_path() {
-        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 42, 1, "", "", "/home/user/tmp/shared", "/home/user/microclaw.data/skills", None);
+        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 42, 1, "", "", "/home/user/tmp/shared", "/home/user/microclaw.data/skills", None, None);
         assert!(prompt.contains("Your workspace path is: /home/user/tmp/shared"));
     }
 
@@ -1926,6 +1971,7 @@ mod tests {
             "",
             "./workspace/shared",
             "./workspace/skills",
+            None,
             None,
         );
         assert!(prompt.contains("Your workspace path is: ./workspace/shared"));
@@ -1955,7 +2001,7 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_includes_persona_id_and_tiered_memory() {
-        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 42, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None);
+        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 42, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None, None);
         assert!(prompt.contains("persona_id is 1"));
         assert!(prompt.contains("read_tiered_memory"));
         assert!(prompt.contains("write_tiered_memory"));
@@ -2183,7 +2229,7 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_mentions_sub_agent() {
-        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None);
+        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None, None);
         assert!(prompt.contains("sub_agent"));
     }
 
@@ -2218,7 +2264,7 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_mentions_xml_security() {
-        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None);
+        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None, None);
         assert!(prompt.contains("user_message"));
         assert!(prompt.contains("untrusted"));
     }
@@ -2412,7 +2458,7 @@ mod tests {
     fn test_build_system_prompt_with_memory_and_skills() {
         let principles = "Test";
         let skills = "- translate: Translate text";
-        let prompt = build_system_prompt("bot", principles, "microclaw.data/AGENTS.md", "", 42, 1, skills, "", "./tmp/shared", "./microclaw.data/skills", None);
+        let prompt = build_system_prompt("bot", principles, "microclaw.data/AGENTS.md", "", 42, 1, skills, "", "./tmp/shared", "./microclaw.data/skills", None, None);
         assert!(prompt.contains("# Principles"));
         assert!(prompt.contains("Test"));
         assert!(prompt.contains("# Agent Skills"));
@@ -2421,20 +2467,20 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_mentions_tiered_memory() {
-        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None);
+        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None, None);
         assert!(prompt.contains("read_tiered_memory"));
         assert!(prompt.contains("write_tiered_memory"));
     }
 
     #[test]
     fn test_build_system_prompt_mentions_export() {
-        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None);
+        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None, None);
         assert!(prompt.contains("export_chat"));
     }
 
     #[test]
     fn test_build_system_prompt_mentions_schedule() {
-        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None);
+        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "", "./tmp/shared", "./microclaw.data/skills", None, None);
         assert!(prompt.contains("schedule_task"));
         assert!(prompt.contains("6-field cron"));
     }

@@ -7,13 +7,26 @@ pub struct MemoryManager {
     data_dir: PathBuf,
     /// Global AGENTS.md is read/written from workspace root shared/AGENTS.md (single source of truth).
     working_dir: PathBuf,
+    /// Optional override for principles path (relative to working_dir). Default: AGENTS.md at workspace root.
+    principles_path_override: Option<String>,
 }
 
 impl MemoryManager {
     pub fn new(data_dir: &str, working_dir: &str) -> Self {
+        MemoryManager::with_principles_path(data_dir, working_dir, None)
+    }
+
+    /// Create MemoryManager with optional principles path override (e.g. "shared/ORIGIN/AGENTS.md").
+    pub fn with_principles_path(
+        data_dir: &str,
+        working_dir: &str,
+        principles_path_override: Option<String>,
+    ) -> Self {
         MemoryManager {
             data_dir: PathBuf::from(data_dir).join("groups"),
             working_dir: PathBuf::from(working_dir),
+            principles_path_override: principles_path_override
+                .filter(|p| !p.trim().is_empty()),
         }
     }
 
@@ -26,9 +39,14 @@ impl MemoryManager {
         self.data_dir.join(chat_id.to_string()).join("AGENTS.md")
     }
 
-    /// Path for shared principles for all chats/personas: workspace_dir/AGENTS.md (at workspace root).
+    /// Path for shared principles for all chats/personas: workspace_dir/AGENTS.md (at workspace root),
+    /// or vault.principles_path if configured (e.g. shared/ORIGIN/AGENTS.md).
     fn groups_root_memory_path(&self) -> PathBuf {
-        self.working_dir.join("AGENTS.md")
+        if let Some(ref p) = self.principles_path_override {
+            self.working_dir.join(p.trim().trim_start_matches('/'))
+        } else {
+            self.working_dir.join("AGENTS.md")
+        }
     }
 
     /// Path string for AGENTS.md (principles, for display in system prompt).

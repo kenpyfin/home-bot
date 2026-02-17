@@ -465,7 +465,12 @@ async fn main() -> anyhow::Result<()> {
     let db = db::Database::new(&runtime_data_dir)?;
     info!("Database initialized");
 
-    let memory_manager = memory::MemoryManager::new(&runtime_data_dir, config.working_dir());
+    let principles_path = config.vault.as_ref().and_then(|v| v.principles_path.clone());
+    let memory_manager = memory::MemoryManager::with_principles_path(
+        &runtime_data_dir,
+        config.working_dir(),
+        principles_path,
+    );
     info!("Memory manager initialized");
 
     let skill_manager = skills::SkillManager::from_skills_dir(&skills_data_dir);
