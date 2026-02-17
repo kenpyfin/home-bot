@@ -527,58 +527,68 @@ async fn handle_message(
         text.chars().take(100).collect::<String>()
     );
 
-    // Start continuous typing indicator
-    let typing_chat_id = msg.chat.id;
-    let typing_bot = bot.clone();
-    let typing_handle = tokio::spawn(async move {
-        loop {
-            let _ = typing_bot
-                .send_chat_action(typing_chat_id, ChatAction::Typing)
-                .await;
-            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    // Run agent in a background task so webhook/request timeout cannot kill it before the reply is sent.
+    let state_spawn = state.clone();
+    let bot_spawn = bot.clone();
+    let chat_id_spawn = msg.chat.id;
+    let runtime_chat_type_owned = runtime_chat_type.to_string();
+    tokio::spawn(async move {
+        // Typing indicator for the duration of the run
+        let typing_bot = bot_spawn.clone();
+        let typing_chat_id = chat_id_spawn;
+        let typing_handle = tokio::spawn(async move {
+            loop {
+                let _ = typing_bot
+                    .send_chat_action(typing_chat_id, ChatAction::Typing)
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            }
+        });
+
+        match process_with_agent(
+            &state_spawn,
+            AgentRequestContext {
+                caller_channel: "telegram",
+                chat_id: chat_id_spawn.0,
+                chat_type: &runtime_chat_type_owned,
+                persona_id,
+            },
+            None,
+            image_data,
+        )
+        .await
+        {
+            Ok(response) => {
+                typing_handle.abort();
+
+                if !response.is_empty() {
+                    send_response(&bot_spawn, chat_id_spawn, &response).await;
+
+                    let bot_msg = StoredMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        chat_id: chat_id_spawn.0,
+                        persona_id,
+                        sender_name: state_spawn.config.bot_username.clone(),
+                        content: response,
+                        is_from_bot: true,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = call_blocking(
+                        state_spawn.db.clone(),
+                        move |db| db.store_message(&bot_msg),
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                typing_handle.abort();
+                error!("Error processing message: {}", e);
+                let _ = bot_spawn
+                    .send_message(chat_id_spawn, format!("Error: {e}"))
+                    .await;
+            }
         }
     });
-
-    // Process with Claude
-    match process_with_agent(
-        &state,
-        AgentRequestContext {
-            caller_channel: "telegram",
-            chat_id,
-            chat_type: runtime_chat_type,
-            persona_id,
-        },
-        None,
-        image_data,
-    )
-    .await
-    {
-        Ok(response) => {
-            typing_handle.abort();
-
-            if !response.is_empty() {
-                send_response(&bot, msg.chat.id, &response).await;
-
-                // Store bot response
-                let bot_msg = StoredMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    chat_id,
-                    persona_id,
-                    sender_name: state.config.bot_username.clone(),
-                    content: response,
-                    is_from_bot: true,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                };
-                let _ = call_blocking(state.db.clone(), move |db| db.store_message(&bot_msg)).await;
-            }
-            // If response is empty, agent likely used send_message tool directly
-        }
-        Err(e) => {
-            typing_handle.abort();
-            error!("Error processing message: {}", e);
-            let _ = bot.send_message(msg.chat.id, format!("Error: {e}")).await;
-        }
-    }
 
     Ok(())
 }

@@ -616,6 +616,8 @@ function App() {
             throw new Error('missing run_id')
           }
 
+          let receivedDone = false
+
           const query = new URLSearchParams({ run_id: runId })
           const streamResponse = await fetch(`/api/stream?${query.toString()}`, {
             method: 'GET',
@@ -734,6 +736,7 @@ function App() {
             }
 
             if (event.event === 'done') {
+              receivedDone = true
               // Command shortcuts (e.g. /persona, /reset) return full response in done only, no deltas
               const doneResponse =
                 typeof (data as { response?: string }).response === 'string'
@@ -746,6 +749,29 @@ function App() {
               }
               setStatusText('Done')
               break
+            }
+          }
+
+          // If stream ended without "done" (disconnect, tab close, timeout), poll until run completes so the user sees the result without sending a follow-up message.
+          if (!receivedDone && runId) {
+            const pollIntervalMs = 2500
+            const pollMaxMs = 10 * 60 * 1000 // 10 minutes
+            const start = Date.now()
+            while (Date.now() - start < pollMaxMs) {
+              await new Promise((r) => setTimeout(r, pollIntervalMs))
+              try {
+                const status = await api<{ done?: boolean }>(
+                  `/api/run_status?run_id=${encodeURIComponent(runId)}`,
+                )
+                if (status.done === true) {
+                  setStatusText('Done')
+                  await loadHistory(sessionKey)
+                  break
+                }
+              } catch {
+                // Run not found (404) or other error — stop polling
+                break
+              }
             }
           }
         } finally {
