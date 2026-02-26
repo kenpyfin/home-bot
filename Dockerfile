@@ -19,22 +19,31 @@ RUN npm --prefix web run build
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ ./src/
 COPY builtin_skills/ ./builtin_skills/
-COPY microclaw.data/ ./microclaw.data/
 RUN cargo build --release
 
 # Stage 2: Runtime with Playwright (Chromium) + agent-browser
 FROM mcr.microsoft.com/playwright:v1.48.0-noble AS runtime
 
-# Install Node.js (playwright image may have it; ensure npm for agent-browser)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Install Node.js (playwright image may have it; ensure npm for agent-browser), git for vault push,
+# and Python 3.12 for vault tools (query_vault, index_vault with ChromaDB)
+# Retry apt-get on hash mismatch (transient Ubuntu CDN issues)
+RUN for i in 1 2 3; do apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates git python3.12 python3.12-venv \
+    && rm -rf /var/lib/apt/lists/* && break || sleep 15; done
 
-# Install agent-browser globally
+# Install agent-browser globally (browser tool uses this path in container)
 RUN npm install -g agent-browser && agent-browser install
+ENV AGENT_BROWSER_PATH=/usr/local/bin/agent-browser
 
 # Copy microclaw binary from builder
 COPY --from=builder /build/target/release/microclaw /usr/local/bin/microclaw
+
+# Built-in vault scripts (query_vault, index_vault)
+COPY scripts/vault/ /app/scripts/vault/
+
+# Entrypoint ensures workspace layout (e.g. shared/vault_db for vector DB)
+COPY scripts/docker-entrypoint.sh /app/scripts/docker-entrypoint.sh
+RUN chmod +x /app/scripts/docker-entrypoint.sh
 
 WORKDIR /app
 
@@ -47,4 +56,5 @@ EXPOSE 10961
 # Chromium needs more shared memory; 1gb recommended
 ENV NODE_OPTIONS="--max-old-space-size=512"
 
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
 CMD ["microclaw", "start"]

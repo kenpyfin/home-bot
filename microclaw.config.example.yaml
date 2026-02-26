@@ -1,5 +1,5 @@
-# MicroClaw configuration
-# Copy this file to microclaw.config.yaml and fill in the required values.
+# MicroClaw configuration (legacy YAML format)
+# Use .env instead: cp .env.example .env and run microclaw setup.
 
 # Telegram bot token from @BotFather
 telegram_bot_token: ""
@@ -23,11 +23,17 @@ max_tool_iterations: 100
 max_history_messages: 50
 # Maximum inbound Telegram document size in MB
 max_document_size_mb: 100
-# Workspace directory (required). Single root for runtime, skills, and tool workspace.
+# Workspace directory (optional). Single root for runtime, skills, and tool workspace.
 # Layout: workspace_dir/runtime, workspace_dir/skills, workspace_dir/shared. Copy this folder to migrate.
-workspace_dir: "./workspace"
+# Omit or leave empty: default ./workspace (or MICROCLAW_WORKSPACE_DIR in Docker).
+# Default default to copy ./workspace to the container
+# workspace_dir: "./workspace"
 # IANA timezone for scheduling (e.g. "US/Eastern", "Europe/London")
 timezone: "UTC"
+
+# Orchestrator (plan-first architecture). Runs planning step before main agent loop.
+# orchestrator_enabled: true
+# orchestrator_model: ""   # Optional: faster/cheaper model for planning; if empty, use main model
 
 # OpenAI API key for voice transcription via Whisper (optional)
 # openai_api_key: ""
@@ -87,19 +93,6 @@ web_session_idle_ttl_seconds: 300
 # Timeout in seconds for cursor-agent runs (default: 600)
 # cursor_agent_timeout_secs: 600
 
-# Social media OAuth (optional). Each platform is disabled if client_id/client_secret are empty.
-# base_url must be reachable for OAuth callbacks (e.g. https://your-domain.com or ngrok URL).
-# social:
-#   base_url: "https://your-domain.com"
-#   tiktok:
-#     client_id: ""
-#     client_secret: ""
-#   instagram:   # Meta / Facebook app
-#     client_id: ""
-#     client_secret: ""
-#   linkedin:
-#     client_id: ""
-#     client_secret: ""
 
 # ORIGIN Obsidian vault / vector DB (optional). Paths are relative to workspace_dir.
 # When set, these values are injected into the system prompt so the bot knows vault paths.

@@ -47,17 +47,16 @@ FEATURES:
 SETUP:
     1. Run: microclaw config
        (or run microclaw start and follow auto-config on first launch)
-    2. Edit microclaw.config.yaml with required values:
+    2. Copy .env.example to .env and fill in required values (or run microclaw setup):
 
        api_key               LLM API key (optional when llm_provider=ollama)
        At least one channel token must be set (Telegram or Discord)
 
     3. Run: microclaw start
 
-CONFIG FILE (microclaw.config.yaml):
-    MicroClaw reads configuration from microclaw.config.yaml (or microclaw.config.yml).
-    Override the path with MICROCLAW_CONFIG env var.
-    See microclaw.config.example.yaml for all available fields.
+CONFIG FILE (.env):
+    MicroClaw reads configuration from .env in the current directory.
+    Copy .env.example to .env and fill in values. Override path with MICROCLAW_CONFIG.
 
     Core fields:
       llm_provider           Provider preset (default: anthropic)
@@ -120,7 +119,7 @@ async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
         Ok(c) => c,
         Err(MicroClawError::Config(e)) => {
             eprintln!("Config error: {e}");
-            eprintln!("Set MICROCLAW_CONFIG or create microclaw.config.yaml");
+            eprintln!("Set MICROCLAW_CONFIG or create .env (copy from .env.example)");
             std::process::exit(1);
         }
         Err(e) => {
@@ -435,14 +434,20 @@ async fn main() -> anyhow::Result<()> {
         Ok(c) => c,
         Err(MicroClawError::Config(e)) => {
             eprintln!("Config missing/invalid: {e}");
-            eprintln!("Launching interactive config...");
-            let saved = config_wizard::run_config_wizard()?;
-            if !saved {
-                return Err(anyhow::anyhow!(
-                    "config canceled and config is still incomplete"
-                ));
+            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                eprintln!("Launching interactive config...");
+                let saved = config_wizard::run_config_wizard()?;
+                if !saved {
+                    return Err(anyhow::anyhow!(
+                        "config canceled and config is still incomplete"
+                    ));
+                }
+                Config::load()?
+            } else {
+                eprintln!("Not running in a terminal (e.g. Docker). Create or fix .env instead of using interactive config.");
+                eprintln!("  cp .env.example .env && edit .env with TELEGRAM_BOT_TOKEN, BOT_USERNAME, LLM_API_KEY, etc.");
+                return Err(anyhow::anyhow!("config required: {e}"));
             }
-            Config::load()?
         }
         Err(e) => return Err(e.into()),
     };
@@ -450,7 +455,7 @@ async fn main() -> anyhow::Result<()> {
 
     let data_root_dir = config.data_root_dir();
     let runtime_data_dir = config.runtime_data_dir();
-    let skills_data_dir = config.skills_data_dir();
+    let workspace_root = config.workspace_root_absolute();
     migrate_legacy_runtime_layout(&data_root_dir, Path::new(&runtime_data_dir));
     migrate_repo_shared_into_workspace(Path::new(config.working_dir()));
     migrate_agents_md_to_workspace_root(Path::new(config.working_dir()), Path::new(&runtime_data_dir));
@@ -473,7 +478,11 @@ async fn main() -> anyhow::Result<()> {
     );
     info!("Memory manager initialized");
 
-    let skill_manager = skills::SkillManager::from_skills_dir(&skills_data_dir);
+    // Use absolute paths and include workspace/shared/skills so skills created by any
+    // persona (even if written to shared workspace) are discoverable by all personas.
+    let primary_skills = workspace_root.join("skills");
+    let shared_skills = workspace_root.join("shared").join("skills");
+    let skill_manager = skills::SkillManager::from_skills_dirs([&primary_skills, &shared_skills]);
     let discovered = skill_manager.discover_skills();
     info!(
         "Skill manager initialized ({} skills discovered)",

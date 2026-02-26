@@ -205,6 +205,44 @@ main() {
     log "Make sure '$HOME/.local/bin' is in PATH."
     log "Example: export PATH=\"\$HOME/.local/bin:\$PATH\""
   fi
+
+  # Use full path so setup/start work even if install_dir is not on PATH yet
+  local microclaw_cmd="${install_dir}/${BIN_NAME}"
+
+  if [ -t 0 ]; then
+    log ""
+    printf "Run setup now in this directory? (Telegram, LLM, workspace, optional vault) [Y/n] "
+    read -r run_setup
+    run_setup="$(echo "${run_setup:-y}" | tr '[:upper:]' '[:lower:]')"
+    if [ "$run_setup" != "n" ] && [ "$run_setup" != "no" ]; then
+      if [ -x "$microclaw_cmd" ]; then
+        log ""
+        "$microclaw_cmd" setup || true
+        log ""
+        printf "Start the bot now? [y/N] "
+        read -r run_start
+        run_start="$(echo "${run_start:-n}" | tr '[:upper:]' '[:lower:]')"
+        if [ "$run_start" = "y" ] || [ "$run_start" = "yes" ]; then
+          log ""
+          "$microclaw_cmd" start
+        else
+          log "Run: ${BIN_NAME} start"
+        fi
+      else
+        log "Run: ${BIN_NAME} setup   # then ${BIN_NAME} start"
+      fi
+    else
+      log ""
+      log "When ready: cd to your project dir, then ${BIN_NAME} setup && ${BIN_NAME} start"
+    fi
+  else
+    log ""
+    log "Next steps:"
+    log "  1) cd to your project directory (or where you want the default workspace)"
+    log "  2) ${BIN_NAME} setup   # Configure Telegram, LLM, workspace; optional ORIGIN vault and vector DB (shared/vault_db)"
+    log "  3) ${BIN_NAME} start   # Start the bot (default workspace: ./workspace)"
+  fi
+  log ""
   log "Run: ${BIN_NAME} help"
 }
 

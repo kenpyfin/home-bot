@@ -152,8 +152,8 @@ fn check_config(report: &mut DoctorReport) {
             "config.file",
             "Config file",
             CheckStatus::Warn,
-            "microclaw.config.yaml not found".to_string(),
-            Some("Run `microclaw config` to create configuration.".to_string()),
+            ".env not found".to_string(),
+            Some("Run `microclaw setup` or copy .env.example to .env.".to_string()),
         ),
         Err(err) => report.push(
             "config.file",

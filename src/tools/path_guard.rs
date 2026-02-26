@@ -8,15 +8,6 @@ const BLOCKED_SUBPATHS: &[&[&str]] = &[&[".config", "gcloud"]];
 
 /// File names that are always blocked (exact component match).
 const BLOCKED_FILES: &[&str] = &[
-    ".env",
-    ".env.local",
-    ".env.production",
-    ".env.development",
-    "credentials",
-    "credentials.json",
-    "token.json",
-    "secrets.yaml",
-    "secrets.json",
     "id_rsa",
     "id_rsa.pub",
     "id_ed25519",
@@ -27,6 +18,20 @@ const BLOCKED_FILES: &[&str] = &[
     "id_dsa.pub",
     ".netrc",
     ".npmrc",
+];
+
+/// Credential-style files blocked everywhere except under a "skills" directory
+/// (e.g. workspace/skills/<skill_name>/.env is allowed for skill config).
+const CREDENTIAL_FILES: &[&str] = &[
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    "credentials",
+    "credentials.json",
+    "token.json",
+    "secrets.yaml",
+    "secrets.json",
 ];
 
 /// Absolute paths that are always blocked.
@@ -68,12 +73,19 @@ pub fn is_blocked(path: &Path) -> bool {
         .collect();
 
     // Check each component against blocked dirs and files
-    for component in &components {
+    for (i, component) in components.iter().enumerate() {
         if BLOCKED_DIRS.contains(&component.as_str()) {
             return true;
         }
         if BLOCKED_FILES.contains(&component.as_str()) {
             return true;
+        }
+        if CREDENTIAL_FILES.contains(&component.as_str()) {
+            // Allow credential files only when under a "skills" directory (skill folder .env, token.json, etc.)
+            let under_skills = components[..i].iter().any(|c| c.as_str() == "skills");
+            if !under_skills {
+                return true;
+            }
         }
     }
 
@@ -136,11 +148,18 @@ mod tests {
     }
 
     #[test]
-    fn test_blocks_env_files() {
+    fn test_blocks_env_files_at_project_root() {
         assert!(is_blocked(Path::new("/project/.env")));
         assert!(is_blocked(Path::new("/project/.env.local")));
         assert!(is_blocked(Path::new("/project/.env.production")));
         assert!(is_blocked(Path::new("/project/.env.development")));
+    }
+
+    #[test]
+    fn test_allows_env_files_under_skills_dir() {
+        assert!(!is_blocked(Path::new("/project/workspace/skills/linkedin/.env")));
+        assert!(!is_blocked(Path::new("/project/workspace/skills/check-email/.env")));
+        assert!(!is_blocked(Path::new("workspace/skills/my-skill/token.json")));
     }
 
     #[test]

@@ -226,7 +226,7 @@ impl Tool for BrowserTool {
                 let wrong_binary = stderr.contains("microclaw-browser") || stderr.contains("missing --port");
                 if wrong_binary {
                     result_text = format!(
-                        "Wrong agent-browser binary. The program at '{}' appears to be microclaw-browser (Rust), not the npm agent-browser. The browser tool requires the npm agent-browser CLI (open, snapshot, click, etc.). Fix: set agent_browser_path in microclaw.config.yaml to the npm binary, e.g. \"/opt/homebrew/bin/agent-browser\" or \"~/.local/bin/agent-browser\". Raw output:\n\n{}",
+                        "Wrong agent-browser binary. The program at '{}' appears to be microclaw-browser (Rust), not the npm agent-browser. The browser tool requires the npm agent-browser CLI (open, snapshot, click, etc.). Fix: set AGENT_BROWSER_PATH in .env to the npm binary, e.g. \"/opt/homebrew/bin/agent-browser\" or \"~/.local/bin/agent-browser\". Raw output:\n\n{}",
                         program,
                         result_text
                     );
@@ -252,7 +252,7 @@ impl Tool for BrowserTool {
                 let msg = if e.to_string().contains("No such file") || e.to_string().contains("not found") {
                     format!(
                         "Browser automation is not available: the command '{}' was not found. \
-                        Fix: (1) Install agent-browser: npm install -g agent-browser, then agent-browser install; (2) if the bot runs as a service or PATH doesn't include agent-browser, set agent_browser_path in microclaw.config.yaml to the full path (e.g. agent_browser_path: \"$HOME/.local/bin/agent-browser\" or agent_browser_path: \"~/.local/bin/agent-browser\"). Raw error: {e}",
+                        Fix: (1) Install agent-browser: npm install -g agent-browser, then agent-browser install; (2) if the bot runs as a service or PATH doesn't include agent-browser, set AGENT_BROWSER_PATH in .env to the full path (e.g. agent_browser_path: \"$HOME/.local/bin/agent-browser\" or agent_browser_path: \"~/.local/bin/agent-browser\"). Raw error: {e}",
                         program
                     )
                 } else {

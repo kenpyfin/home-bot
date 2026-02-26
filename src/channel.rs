@@ -53,10 +53,10 @@ pub async fn deliver_and_store_bot_message(
             .map_err(|e| format!("Failed to store web message: {e}"))
     } else {
         let formatted = markdown_to_telegram_html(text);
-        bot.send_message(ChatId(chat_id), &formatted)
+        let send_result = bot
+            .send_message(ChatId(chat_id), &formatted)
             .parse_mode(ParseMode::Html)
-            .await
-            .map_err(|e| format!("Failed to send message: {e}"))?;
+            .await;
         let msg = StoredMessage {
             id: uuid::Uuid::new_v4().to_string(),
             chat_id,
@@ -66,6 +66,29 @@ pub async fn deliver_and_store_bot_message(
             is_from_bot: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
+        match &send_result {
+            Ok(_) => {}
+            Err(e) => {
+                let err_str = e.to_string();
+                // Chat may have been deleted or bot removed; still store so conversation history is intact (e.g. web UI can show reply).
+                if err_str.contains("chat not found")
+                    || err_str.contains("Chat not found")
+                    || err_str.contains("user is deactivated")
+                {
+                    tracing::warn!(
+                        target: "channel",
+                        chat_id = chat_id,
+                        error = %err_str,
+                        "Telegram delivery failed (chat unavailable); storing message anyway"
+                    );
+                    call_blocking(db.clone(), move |d| d.store_message(&msg))
+                        .await
+                        .map_err(|e| format!("Failed to store message: {e}"))?;
+                    return Ok(());
+                }
+                return Err(format!("Failed to send message: {e}"));
+            }
+        }
         call_blocking(db.clone(), move |d| d.store_message(&msg))
             .await
             .map_err(|e| format!("Failed to store sent message: {e}"))

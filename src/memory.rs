@@ -155,8 +155,9 @@ impl MemoryManager {
         std::fs::write(path, content)
     }
 
-    /// Build memory context for the system prompt: per-persona MEMORY.md and daily logs.
+    /// Build memory context for the system prompt: per-persona MEMORY.md only.
     /// Principles (workspace_dir/AGENTS.md) are loaded separately and injected as the "Principles" section.
+    /// Daily logs are intentionally excluded to reduce context pollution.
     pub fn build_memory_context(&self, chat_id: i64, persona_id: i64) -> String {
         let mut context = String::new();
 
@@ -164,15 +165,8 @@ impl MemoryManager {
             if !persona_mem.trim().is_empty() {
                 context.push_str("<memory_this_persona>\n");
                 context.push_str(&persona_mem);
-                context.push_str("\n</memory_this_persona>\n\n");
+                context.push_str("\n</memory_this_persona>\n");
             }
-        }
-
-        let daily = self.read_daily_logs_today_yesterday(chat_id, persona_id);
-        if !daily.is_empty() {
-            context.push_str("<recent_daily_log>\n");
-            context.push_str(&daily);
-            context.push_str("\n</recent_daily_log>\n");
         }
 
         context

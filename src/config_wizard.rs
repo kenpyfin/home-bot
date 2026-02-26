@@ -154,18 +154,15 @@ fn resolve_config_path() -> PathBuf {
     if let Ok(custom) = std::env::var("MICROCLAW_CONFIG") {
         return PathBuf::from(custom);
     }
-    if Path::new("./microclaw.config.yaml").exists() {
-        PathBuf::from("./microclaw.config.yaml")
-    } else if Path::new("./microclaw.config.yml").exists() {
-        PathBuf::from("./microclaw.config.yml")
+    if Path::new("./.env").exists() {
+        PathBuf::from("./.env")
     } else {
-        PathBuf::from("./microclaw.config.yaml")
+        PathBuf::from("./.env")
     }
 }
 
 fn load_existing_config(path: &Path) -> Option<Config> {
-    let content = fs::read_to_string(path).ok()?;
-    serde_yaml::from_str::<Config>(&content).ok()
+    Config::load_from_path(path).ok()
 }
 
 fn prompt_line(
@@ -334,14 +331,19 @@ fn prompt_model(
     Ok(Some(trimmed.to_string()))
 }
 
-fn save_config_yaml(path: &Path, config: &Config) -> Result<Option<PathBuf>, MicroClawError> {
+fn escape_env_val(s: &str) -> String {
+    if s.contains(' ') || s.contains('"') || s.contains('#') || s.is_empty() {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn save_config_env(path: &Path, config: &Config) -> Result<Option<PathBuf>, MicroClawError> {
     let mut backup = None;
     if path.exists() {
         let ts = Utc::now().format("%Y%m%d%H%M%S");
-        let backup_path = path.with_extension(format!(
-            "{}.bak.{ts}",
-            path.extension().and_then(|s| s.to_str()).unwrap_or("yaml")
-        ));
+        let backup_path = path.with_extension(format!("env.bak.{ts}"));
         fs::copy(path, &backup_path)?;
         backup = Some(backup_path);
     }
@@ -349,8 +351,49 @@ fn save_config_yaml(path: &Path, config: &Config) -> Result<Option<PathBuf>, Mic
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let content = serde_yaml::to_string(config)
-        .map_err(|e| MicroClawError::Config(format!("Failed to serialize config: {e}")))?;
+
+    let mut lines = Vec::new();
+    lines.push("# MicroClaw configuration".into());
+    lines.push("".into());
+    lines.push("# Telegram".into());
+    lines.push(format!("TELEGRAM_BOT_TOKEN={}", escape_env_val(&config.telegram_bot_token)));
+    lines.push(format!("BOT_USERNAME={}", escape_env_val(&config.bot_username)));
+    lines.push("".into());
+    lines.push("# LLM".into());
+    lines.push(format!("LLM_PROVIDER={}", escape_env_val(&config.llm_provider)));
+    lines.push(format!("LLM_API_KEY={}", escape_env_val(&config.api_key)));
+    if !config.model.is_empty() {
+        lines.push(format!("LLM_MODEL={}", escape_env_val(&config.model)));
+    }
+    if let Some(ref u) = config.llm_base_url {
+        if !u.is_empty() {
+            lines.push(format!("LLM_BASE_URL={}", escape_env_val(u)));
+        }
+    }
+    lines.push("".into());
+    lines.push("# Workspace".into());
+    lines.push(format!("WORKSPACE_DIR={}", escape_env_val(&config.workspace_dir)));
+    lines.push(format!("TIMEZONE={}", escape_env_val(&config.timezone)));
+    if let Some(ref v) = config.vault {
+        lines.push("".into());
+        lines.push("# ORIGIN vault".into());
+        if let Some(ref p) = v.origin_vault_path {
+            lines.push(format!("VAULT_ORIGIN_VAULT_PATH={}", escape_env_val(p)));
+        } else {
+            lines.push("VAULT_ORIGIN_VAULT_PATH=shared/ORIGIN".into());
+        }
+        if let Some(ref p) = v.vector_db_path {
+            lines.push(format!("VAULT_VECTOR_DB_PATH={}", escape_env_val(p)));
+        } else {
+            lines.push("VAULT_VECTOR_DB_PATH=shared/vault_db".into());
+        }
+        if let Some(ref r) = v.origin_vault_repo {
+            if !r.is_empty() {
+                lines.push(format!("VAULT_ORIGIN_VAULT_REPO={}", escape_env_val(r)));
+            }
+        }
+    }
+    let content = lines.join("\n");
     fs::write(path, content)?;
     Ok(backup)
 }
@@ -401,6 +444,8 @@ fn default_config() -> Config {
         cursor_agent_timeout_secs: 600,
         social: None,
         vault: None,
+        orchestrator_enabled: true,
+        orchestrator_model: String::new(),
     }
 }
 
@@ -529,7 +574,7 @@ pub fn run_config_wizard() -> Result<bool, MicroClawError> {
     fs::create_dir_all(&out.workspace_dir)?;
     let _ = fs::create_dir_all(std::path::Path::new(&out.workspace_dir).join("shared"));
 
-    let backup = save_config_yaml(&config_path, &out)?;
+    let backup = save_config_env(&config_path, &out)?;
     println!();
     println!("Saved config to {}", config_path.display());
     if let Some(b) = backup {

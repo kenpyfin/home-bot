@@ -66,10 +66,11 @@ pub fn parse(text: &str) -> Option<SlashCommand> {
         return Some(SlashCommand::Archive);
     }
     if lower == "/schedule" || lower.starts_with("/schedule ")
-        || lower == "/jobs" || lower.starts_with("/jobs ")
-        || lower == "/scheduled" || lower.starts_with("/scheduled ")
-        || lower == "/scheduledjob" || lower.starts_with("/scheduledjob ")
-        || lower == "/scheduled_job" || lower.starts_with("/scheduled_job ")
+        || lower.starts_with("/schedule@")
+        || lower == "/jobs" || lower.starts_with("/jobs ") || lower.starts_with("/jobs@")
+        || lower == "/scheduled" || lower.starts_with("/scheduled ") || lower.starts_with("/scheduled@")
+        || lower == "/scheduledjob" || lower.starts_with("/scheduledjob ") || lower.starts_with("/scheduledjob@")
+        || lower == "/scheduled_job" || lower.starts_with("/scheduled_job ") || lower.starts_with("/scheduled_job@")
     {
         return Some(SlashCommand::Schedule);
     }
@@ -111,6 +112,9 @@ mod tests {
         assert_eq!(parse("/scheduled"), Some(SlashCommand::Schedule));
         assert_eq!(parse("/scheduledjob"), Some(SlashCommand::Schedule));
         assert_eq!(parse("/scheduled_job"), Some(SlashCommand::Schedule));
+        // Telegram group commands with @botname
+        assert_eq!(parse("/schedule@MyBot"), Some(SlashCommand::Schedule));
+        assert_eq!(parse("/jobs@HomeBot"), Some(SlashCommand::Schedule));
     }
 
     #[test]

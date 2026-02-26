@@ -103,7 +103,8 @@ impl Database {
         std::fs::create_dir_all(data_dir)?;
 
         let conn = Connection::open(db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // PRAGMA journal_mode returns a row; use query_row to consume it (execute_batch fails with extra_check)
+        let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chats (
@@ -213,6 +214,7 @@ impl Database {
         )?;
 
         Self::migrate_persona_schema(&conn)?;
+        Self::migrate_fts(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
@@ -340,6 +342,38 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_fts(conn: &Connection) -> Result<(), MicroClawError> {
+        // Create FTS5 virtual table and triggers (after all table migrations)
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                content,
+                content='messages',
+                content_rowid='rowid'
+            );
+            CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_fts_bd BEFORE DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+                INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+            END;",
+        )?;
+
+        // One-time migration: populate FTS from existing messages if FTS is empty but messages has data
+        let fts_count: i64 =
+            conn.query_row("SELECT count(*) FROM messages_fts", [], |r| r.get(0))?;
+        let msg_count: i64 =
+            conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
+        if fts_count == 0 && msg_count > 0 {
+            conn.execute("INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages", [])?;
+        }
+
+        Ok(())
+    }
+
     pub fn upsert_chat(
         &self,
         chat_id: i64,
@@ -353,6 +387,7 @@ impl Database {
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(chat_id) DO UPDATE SET
                 chat_title = COALESCE(?2, chat_title),
+                chat_type = ?3,
                 last_message_time = ?4",
             params![chat_id, chat_title, chat_type, now],
         )?;
@@ -626,6 +661,59 @@ impl Database {
         )?;
         let tasks = stmt
             .query_map(params![now], |row| {
+                Ok(ScheduledTask {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    prompt: row.get(2)?,
+                    schedule_type: row.get(3)?,
+                    schedule_value: row.get(4)?,
+                    next_run: row.get(5)?,
+                    last_run: row.get(6)?,
+                    status: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    pub fn get_all_active_tasks(&self) -> Result<Vec<ScheduledTask>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+             FROM scheduled_tasks
+             WHERE status IN ('active', 'paused')
+             ORDER BY id",
+        )?;
+        let tasks = stmt
+            .query_map([], |row| {
+                Ok(ScheduledTask {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    prompt: row.get(2)?,
+                    schedule_type: row.get(3)?,
+                    schedule_value: row.get(4)?,
+                    next_run: row.get(5)?,
+                    last_run: row.get(6)?,
+                    status: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    /// All scheduled tasks for /schedule and list_scheduled_tasks: active, paused, and completed (all chats/personas).
+    pub fn get_all_scheduled_tasks_for_display(&self) -> Result<Vec<ScheduledTask>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+             FROM scheduled_tasks
+             WHERE status IN ('active', 'paused', 'completed')
+             ORDER BY id",
+        )?;
+        let tasks = stmt
+            .query_map([], |row| {
                 Ok(ScheduledTask {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
@@ -1286,6 +1374,49 @@ impl Database {
             params![model_override, persona_id, chat_id],
         )?;
         Ok(rows > 0)
+    }
+
+    /// Full-text search over message history for a specific chat/persona.
+    /// Returns messages ranked by relevance (FTS5 rank).
+    pub fn search_messages(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        query: &str,
+        limit: usize,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
+    ) -> Result<Vec<StoredMessage>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.chat_id, m.persona_id, m.sender_name, m.content, m.is_from_bot, m.timestamp
+             FROM messages_fts
+             JOIN messages m ON m.rowid = messages_fts.rowid
+             WHERE messages_fts MATCH ?1
+               AND m.chat_id = ?2
+               AND m.persona_id = ?3
+               AND (?4 IS NULL OR m.timestamp >= ?4)
+               AND (?5 IS NULL OR m.timestamp <= ?5)
+             ORDER BY messages_fts.rank
+             LIMIT ?6",
+        )?;
+        let messages = stmt
+            .query_map(
+                params![query, chat_id, persona_id, from_date, to_date, limit as i64],
+                |row| {
+                    Ok(StoredMessage {
+                        id: row.get(0)?,
+                        chat_id: row.get(1)?,
+                        persona_id: row.get(2)?,
+                        sender_name: row.get(3)?,
+                        content: row.get(4)?,
+                        is_from_bot: row.get::<_, i32>(5)? != 0,
+                        timestamp: row.get(6)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(messages)
     }
 }
 

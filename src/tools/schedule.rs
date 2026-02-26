@@ -11,15 +11,31 @@ use crate::db::{call_blocking, Database, ScheduledTask};
 
 /// Format scheduled tasks for slash-command or UI display.
 pub fn format_tasks_list(tasks: &[ScheduledTask]) -> String {
+    format_tasks_list_impl(tasks, false)
+}
+
+/// Format all scheduled tasks (slash /schedule), including chat_id for each.
+pub fn format_tasks_list_all(tasks: &[ScheduledTask]) -> String {
+    format_tasks_list_impl(tasks, true)
+}
+
+fn format_tasks_list_impl(tasks: &[ScheduledTask], include_chat_id: bool) -> String {
     if tasks.is_empty() {
-        return "No scheduled tasks for this chat. Ask me to schedule one (recurring or one-time).".to_string();
+        return "No scheduled tasks. Ask me to schedule one (recurring or one-time).".to_string();
     }
-    let mut output = String::from("Scheduled tasks:\n");
+    let mut output = String::from("Scheduled tasks (all chats/personas):\n");
     for t in tasks {
-        output.push_str(&format!(
-            "#{} [{}] {} | {} '{}' | next: {}\n",
-            t.id, t.status, t.prompt, t.schedule_type, t.schedule_value, t.next_run
-        ));
+        if include_chat_id {
+            output.push_str(&format!(
+                "#{} [{}] chat:{} | {} | {} '{}' | next: {}\n",
+                t.id, t.status, t.chat_id, t.prompt, t.schedule_type, t.schedule_value, t.next_run
+            ));
+        } else {
+            output.push_str(&format!(
+                "#{} [{}] {} | {} '{}' | next: {}\n",
+                t.id, t.status, t.prompt, t.schedule_type, t.schedule_value, t.next_run
+            ));
+        }
     }
     output.push_str("\nUse `schedule_task` to add; `pause_scheduled_task` / `resume_scheduled_task` / `cancel_scheduled_task` to manage.");
     output
@@ -182,12 +198,12 @@ impl Tool for ListTasksTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_scheduled_tasks".into(),
-            description: "List all active and paused scheduled tasks for a chat.".into(),
+            description: "List all scheduled tasks (active, paused, completed) across all chats and personas.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
-                        "description": "The chat ID to list tasks for"
+                        "description": "Caller's chat ID (for auth); tasks shown are global."
                     }
                 }),
                 &["chat_id"],
@@ -207,20 +223,8 @@ impl Tool for ListTasksTool {
             return ToolResult::error(e);
         }
 
-        match call_blocking(self.db.clone(), move |db| db.get_tasks_for_chat(chat_id)).await {
-            Ok(tasks) => {
-                if tasks.is_empty() {
-                    return ToolResult::success("No scheduled tasks found for this chat.".into());
-                }
-                let mut output = String::new();
-                for t in &tasks {
-                    output.push_str(&format!(
-                        "#{} [{}] {} | {} '{}' | next: {}\n",
-                        t.id, t.status, t.prompt, t.schedule_type, t.schedule_value, t.next_run
-                    ));
-                }
-                ToolResult::success(output)
-            }
+        match call_blocking(self.db.clone(), |db| db.get_all_scheduled_tasks_for_display()).await {
+            Ok(tasks) => ToolResult::success(format_tasks_list_all(&tasks)),
             Err(e) => ToolResult::error(format!("Failed to list tasks: {e}")),
         }
     }

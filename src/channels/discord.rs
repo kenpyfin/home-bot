@@ -65,9 +65,9 @@ impl EventHandler for Handler {
                     let _ = msg.channel_id.say(&ctx.http, resp).await;
                 }
                 SlashCommand::Schedule => {
-                    let tasks = call_blocking(self.app_state.db.clone(), move |db| db.get_tasks_for_chat(channel_id)).await;
+                    let tasks = call_blocking(self.app_state.db.clone(), |db| db.get_all_scheduled_tasks_for_display()).await;
                     let text = match &tasks {
-                        Ok(t) => crate::tools::schedule::format_tasks_list(t),
+                        Ok(t) => crate::tools::schedule::format_tasks_list_all(t),
                         Err(e) => format!("Error listing tasks: {e}"),
                     };
                     let _ = msg.channel_id.say(&ctx.http, &text).await;

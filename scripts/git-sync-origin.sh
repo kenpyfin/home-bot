@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Sync ORIGIN Obsidian vault from git.
-# Set ORIGIN_VAULT_PATH (default: ./tmp/shared/ORIGIN) and optionally ORIGIN_VAULT_REPO.
+# Set ORIGIN_VAULT_PATH (default: ./workspace/shared/ORIGIN) and optionally ORIGIN_VAULT_REPO.
 
-ORIGIN_VAULT_PATH="${ORIGIN_VAULT_PATH:-./tmp/shared/ORIGIN}"
+ORIGIN_VAULT_PATH="${ORIGIN_VAULT_PATH:-./workspace/shared/ORIGIN}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "$REPO_ROOT"

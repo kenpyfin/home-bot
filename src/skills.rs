@@ -44,20 +44,38 @@ struct SkillCompatibility {
 }
 
 pub struct SkillManager {
-    skills_dir: PathBuf,
+    /// Primary and additional skills directories. Primary (first) is workspace/skills;
+    /// additional may include workspace/shared/skills so personas that create skills
+    /// in the shared workspace still have them discoverable by all personas.
+    skills_dirs: Vec<PathBuf>,
 }
 
 impl SkillManager {
+    /// Create a SkillManager that scans a single directory.
     pub fn from_skills_dir(skills_dir: &str) -> Self {
         SkillManager {
-            skills_dir: PathBuf::from(skills_dir),
+            skills_dirs: vec![PathBuf::from(skills_dir)],
         }
+    }
+
+    /// Create a SkillManager that scans multiple directories. Skills are merged and
+    /// deduped by name (earlier directories take precedence). Use this to include
+    /// both workspace/skills and workspace/shared/skills so all personas see skills
+    /// regardless of where they were created.
+    pub fn from_skills_dirs(dirs: impl IntoIterator<Item = impl AsRef<std::path::Path>>) -> Self {
+        let skills_dirs: Vec<PathBuf> = dirs
+            .into_iter()
+            .map(|p| p.as_ref().to_path_buf())
+            .collect();
+        SkillManager { skills_dirs }
     }
 
     #[allow(dead_code)]
     pub fn new(data_dir: &str) -> Self {
         let skills_dir = PathBuf::from(data_dir).join("skills");
-        SkillManager { skills_dir }
+        SkillManager {
+            skills_dirs: vec![skills_dir],
+        }
     }
 
     /// Discover all skills that are available on the current platform and satisfy dependency checks.
@@ -66,11 +84,14 @@ impl SkillManager {
     }
 
     fn discover_skills_internal(&self, include_unavailable: bool) -> Vec<SkillMetadata> {
+        let mut seen_names = std::collections::HashSet::new();
         let mut skills = Vec::new();
-        let entries = match std::fs::read_dir(&self.skills_dir) {
-            Ok(e) => e,
-            Err(_) => return skills,
-        };
+
+        for skills_dir in &self.skills_dirs {
+            let entries = match std::fs::read_dir(skills_dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -92,11 +113,16 @@ impl SkillManager {
             };
             if let Ok(content) = std::fs::read_to_string(&skill_md) {
                 if let Some((meta, _body)) = parse_skill_md(&content, &path) {
+                    if seen_names.contains(&meta.name) {
+                        continue;
+                    }
                     if include_unavailable || self.skill_is_available(&meta).is_ok() {
+                        seen_names.insert(meta.name.clone());
                         skills.push(meta);
                     }
                 }
             }
+        }
         }
 
         skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -184,9 +210,14 @@ impl SkillManager {
     }
 
     /// Build a user-facing formatted list of available skills.
-    /// Shows the skills directory path and, if any skills in the folder are unavailable (platform/deps), lists them too.
+    /// Shows the skills directory path(s) and, if any skills in the folder are unavailable (platform/deps), lists them too.
     pub fn list_skills_formatted(&self) -> String {
-        let skills_dir_display = self.skills_dir.to_string_lossy();
+        let skills_dir_display = self
+            .skills_dirs
+            .iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", ");
         let all = self.discover_skills_internal(true);
         let available: Vec<_> = self.discover_skills();
 
@@ -233,7 +264,7 @@ impl SkillManager {
 
     #[allow(dead_code)]
     pub fn skills_dir(&self) -> &PathBuf {
-        &self.skills_dir
+        self.skills_dirs.first().expect("SkillManager has at least one directory")
     }
 }
 

@@ -1,21 +1,25 @@
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::Arc;
 use tracing::info;
 
 use super::{auth_context_from_input, schema_object, Tool, ToolRegistry, ToolResult};
 use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock, ToolDefinition};
 use crate::config::Config;
+use crate::db::Database;
 
 const MAX_SUB_AGENT_ITERATIONS: usize = 10;
 
 pub struct SubAgentTool {
     config: Config,
+    db: Arc<Database>,
 }
 
 impl SubAgentTool {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, db: Arc<Database>) -> Self {
         SubAgentTool {
             config: config.clone(),
+            db,
         }
     }
 }
@@ -58,7 +62,7 @@ impl Tool for SubAgentTool {
         info!("Sub-agent starting task: {}", task);
 
         let llm = crate::llm::create_provider(&self.config);
-        let tools = ToolRegistry::new_sub_agent(&self.config);
+        let tools = ToolRegistry::new_sub_agent(&self.config, Some(self.db.clone()));
         let tool_defs = tools.definitions();
 
         let system_prompt = "You are a sub-agent assistant. Complete the given task thoroughly and return a clear, concise result. You have access to tools for file operations, search, web access, and browser automation (use the browser tool only, not bash). Focus on the task and provide actionable output.".to_string();
@@ -113,13 +117,17 @@ impl Tool for SubAgentTool {
                         ResponseContentBlock::Text { text } => {
                             ContentBlock::Text { text: text.clone() }
                         }
-                        ResponseContentBlock::ToolUse { id, name, input } => {
-                            ContentBlock::ToolUse {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input: input.clone(),
-                            }
-                        }
+                        ResponseContentBlock::ToolUse {
+                            id,
+                            name,
+                            input,
+                            thought_signature,
+                        } => ContentBlock::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                            thought_signature: thought_signature.clone(),
+                        },
                     })
                     .collect();
 
@@ -130,7 +138,9 @@ impl Tool for SubAgentTool {
 
                 let mut tool_results = Vec::new();
                 for block in &response.content {
-                    if let ResponseContentBlock::ToolUse { id, name, input } = block {
+                    if let ResponseContentBlock::ToolUse {
+                        id, name, input, ..
+                    } = block {
                         info!(
                             "Sub-agent executing tool: {} (iteration {})",
                             name,
@@ -230,12 +240,20 @@ mod tests {
             cursor_agent_timeout_secs: 600,
             social: None,
             vault: None,
+            orchestrator_enabled: true,
+            orchestrator_model: String::new(),
         }
+    }
+
+    fn test_db() -> Arc<crate::db::Database> {
+        let dir = std::env::temp_dir()
+            .join(format!("microclaw_subagent_test_{}", uuid::Uuid::new_v4()));
+        Arc::new(crate::db::Database::new(dir.to_str().unwrap()).unwrap())
     }
 
     #[test]
     fn test_sub_agent_tool_name_and_definition() {
-        let tool = SubAgentTool::new(&test_config());
+        let tool = SubAgentTool::new(&test_config(), test_db());
         assert_eq!(tool.name(), "sub_agent");
         let def = tool.definition();
         assert_eq!(def.name, "sub_agent");
@@ -249,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sub_agent_missing_task() {
-        let tool = SubAgentTool::new(&test_config());
+        let tool = SubAgentTool::new(&test_config(), test_db());
         let result = tool.execute(json!({})).await;
         assert!(result.is_error);
         assert!(result.content.contains("Missing required parameter: task"));
@@ -258,7 +276,7 @@ mod tests {
     #[test]
     fn test_sub_agent_restricted_registry_tool_count() {
         let config = test_config();
-        let registry = ToolRegistry::new_sub_agent(&config);
+        let registry = ToolRegistry::new_sub_agent(&config, None);
         let defs = registry.definitions();
         assert_eq!(defs.len(), 12);
     }
@@ -266,7 +284,7 @@ mod tests {
     #[test]
     fn test_sub_agent_restricted_registry_excluded_tools() {
         let config = test_config();
-        let registry = ToolRegistry::new_sub_agent(&config);
+        let registry = ToolRegistry::new_sub_agent(&config, None);
         let defs = registry.definitions();
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
 

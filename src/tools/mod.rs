@@ -12,6 +12,8 @@ pub mod memory;
 pub mod path_guard;
 pub mod read_file;
 pub mod schedule;
+pub mod search_history;
+pub mod search_vault;
 pub mod send_message;
 pub mod social_feed;
 pub mod sub_agent;
@@ -283,6 +285,9 @@ impl ToolRegistry {
             );
         }
         let skills_data_dir = config.skills_data_dir();
+        let workspace_root = config.workspace_root_absolute();
+        let primary_skills = workspace_root.join("skills");
+        let shared_skills = workspace_root.join("shared").join("skills");
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(bash::BashTool::new(config.working_dir())),
             Box::new(browser::BrowserTool::new(
@@ -314,16 +319,59 @@ impl ToolRegistry {
             Box::new(schedule::CancelTaskTool::new(db.clone())),
             Box::new(schedule::GetTaskHistoryTool::new(db.clone())),
             Box::new(export_chat::ExportChatTool::new(db.clone(), &config.runtime_data_dir())),
-            Box::new(sub_agent::SubAgentTool::new(config)),
+            Box::new(sub_agent::SubAgentTool::new(config, db.clone())),
             Box::new(cursor_agent::CursorAgentTool::new(config, db.clone())),
             Box::new(cursor_agent::ListCursorAgentRunsTool::new(db.clone())),
-            Box::new(activate_skill::ActivateSkillTool::new(&skills_data_dir)),
+            Box::new(activate_skill::ActivateSkillTool::new_with_dirs([
+                &primary_skills,
+                &shared_skills,
+            ])),
             Box::new(sync_skills::SyncSkillsTool::new(&skills_data_dir)),
             Box::new(tiered_memory::ReadTieredMemoryTool::new(&config.runtime_data_dir())),
             Box::new(tiered_memory::WriteTieredMemoryTool::new(&config.runtime_data_dir())),
+            Box::new(search_history::SearchHistoryTool::new(db.clone())),
         ];
 
         let mut tools: Vec<Box<dyn Tool>> = tools;
+
+        // Register SearchVaultTool: native mode (embedding + ChromaDB HTTP) or command mode (vault_search_command)
+        if let Some(ref vault) = config.vault {
+            let use_native = vault.embedding_server_url.is_some() && vault.vector_db_url.is_some();
+            let use_command = vault
+                .vault_search_command
+                .as_ref()
+                .map_or(false, |c| !c.trim().is_empty());
+
+            if use_native {
+                let embed_url = vault.embedding_server_url.as_ref().unwrap();
+                let db_url = vault.vector_db_url.as_ref().unwrap();
+                let collection = vault
+                    .vector_db_collection
+                    .as_deref()
+                    .unwrap_or("vault");
+                tools.push(Box::new(search_vault::SearchVaultTool::new_native(
+                    embed_url,
+                    db_url,
+                    collection,
+                )));
+                tracing::info!(
+                    "search_vault tool registered (native: collection={}, db={})",
+                    collection,
+                    db_url
+                );
+            } else if use_command {
+                let cmd = vault.vault_search_command.as_ref().unwrap();
+                tools.push(Box::new(search_vault::SearchVaultTool::new_command(
+                    cmd,
+                    config.working_dir(),
+                )));
+                tracing::info!(
+                    "search_vault tool registered (command: {})",
+                    cmd.split_whitespace().next().unwrap_or("…")
+                );
+            }
+        }
+
         let mut social_added = Vec::new();
         if let Some(ref social) = config.social {
             if social.is_platform_enabled("tiktok") {
@@ -346,7 +394,8 @@ impl ToolRegistry {
     }
 
     /// Create a restricted tool registry for sub-agents (no side-effect or recursive tools).
-    pub fn new_sub_agent(config: &Config) -> Self {
+    /// Pass `db` to enable `search_chat_history` in sub-agents.
+    pub fn new_sub_agent(config: &Config, db: Option<Arc<Database>>) -> Self {
         let working_dir = PathBuf::from(config.working_dir());
         if let Err(e) = std::fs::create_dir_all(&working_dir) {
             tracing::warn!(
@@ -355,8 +404,10 @@ impl ToolRegistry {
                 e
             );
         }
-        let skills_data_dir = config.skills_data_dir();
-        let tools: Vec<Box<dyn Tool>> = vec![
+        let workspace_root = config.workspace_root_absolute();
+        let primary_skills = workspace_root.join("skills");
+        let shared_skills = workspace_root.join("shared").join("skills");
+        let mut tools: Vec<Box<dyn Tool>> = vec![
             Box::new(bash::BashTool::new(config.working_dir())),
             Box::new(browser::BrowserTool::new(
                 &config.runtime_data_dir(),
@@ -371,8 +422,14 @@ impl ToolRegistry {
             Box::new(tiered_memory::ReadTieredMemoryTool::new(&config.runtime_data_dir())),
             Box::new(web_fetch::WebFetchTool),
             Box::new(web_search::WebSearchTool),
-            Box::new(activate_skill::ActivateSkillTool::new(&skills_data_dir)),
+            Box::new(activate_skill::ActivateSkillTool::new_with_dirs([
+                &primary_skills,
+                &shared_skills,
+            ])),
         ];
+        if let Some(db) = db {
+            tools.push(Box::new(search_history::SearchHistoryTool::new(db)));
+        }
         ToolRegistry { tools }
     }
 

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -331,8 +332,16 @@ impl SetupApp {
                     label: "Default working directory",
                     value: existing
                         .get("WORKING_DIR")
+                        .or(existing.get("WORKSPACE_DIR"))
                         .cloned()
-                        .unwrap_or_else(|| "./tmp".into()),
+                        .unwrap_or_else(|| "./workspace".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "VAULT_GIT_URL",
+                    label: "ORIGIN vault git URL (optional; leave empty to create empty folder)",
+                    value: existing.get("VAULT_GIT_URL").cloned().unwrap_or_default(),
                     required: false,
                     secret: false,
                 },
@@ -349,38 +358,41 @@ impl SetupApp {
         }
     }
 
-    /// Load existing config values from microclaw.config.yaml/.yml.
+    /// Load existing config values from .env.
     fn load_existing_config() -> HashMap<String, String> {
-        let yaml_path = if Path::new("./microclaw.config.yaml").exists() {
-            Some("./microclaw.config.yaml")
-        } else if Path::new("./microclaw.config.yml").exists() {
-            Some("./microclaw.config.yml")
-        } else {
-            None
+        let path = Path::new("./.env");
+        if !path.exists() {
+            return HashMap::new();
+        }
+        let Ok(content) = fs::read_to_string(path) else {
+            return HashMap::new();
         };
-
-        if let Some(path) = yaml_path {
-            if let Ok(content) = fs::read_to_string(path) {
-                if let Ok(config) = serde_yaml::from_str::<crate::config::Config>(&content) {
-                    let mut map = HashMap::new();
-                    map.insert("TELEGRAM_BOT_TOKEN".into(), config.telegram_bot_token);
-                    map.insert("BOT_USERNAME".into(), config.bot_username);
-                    map.insert("LLM_PROVIDER".into(), config.llm_provider);
-                    map.insert("LLM_API_KEY".into(), config.api_key);
-                    if !config.model.is_empty() {
-                        map.insert("LLM_MODEL".into(), config.model);
-                    }
-                    if let Some(url) = config.llm_base_url {
-                        map.insert("LLM_BASE_URL".into(), url);
-                    }
-                    map.insert("WORKSPACE_DIR".into(), config.workspace_dir.clone());
-                    map.insert("TIMEZONE".into(), config.timezone);
-                    return map;
+        let mut map = HashMap::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let k = k.trim();
+                let v = v
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
+                if !k.is_empty() {
+                    map.insert(k.to_string(), v);
                 }
             }
         }
-
-        HashMap::new()
+        if map.get("VAULT_GIT_URL").map_or(true, |s| s.is_empty()) {
+            if let Some(repo) = map.get("VAULT_ORIGIN_VAULT_REPO") {
+                if !repo.is_empty() {
+                    map.insert("VAULT_GIT_URL".into(), repo.clone());
+                }
+            }
+        }
+        map
     }
 
     fn next(&mut self) {
@@ -459,7 +471,9 @@ impl SetupApp {
             workspace_dir.trim().to_string()
         };
         fs::create_dir_all(&dir)?;
-        let _ = fs::create_dir_all(Path::new(&dir).join("shared"));
+        let shared = Path::new(&dir).join("shared");
+        let _ = fs::create_dir_all(&shared);
+        let _ = fs::create_dir_all(shared.join("vault_db"));
         let probe = Path::new(&dir).join(".setup_probe");
         fs::write(&probe, "ok")?;
         let _ = fs::remove_file(probe);
@@ -678,7 +692,8 @@ impl SetupApp {
                 .unwrap_or_default(),
             "DATA_DIR" => "./microclaw.data".into(),
             "TIMEZONE" => "UTC".into(),
-            "WORKING_DIR" => "./tmp".into(),
+            "WORKING_DIR" => "./workspace".into(),
+            "VAULT_GIT_URL" => String::new(),
             _ => String::new(),
         }
     }
@@ -865,10 +880,7 @@ fn mask_secret(s: &str) -> String {
     format!("{}***{}", &s[..3], &s[s.len() - 2..])
 }
 
-fn save_config_yaml(
-    path: &Path,
-    values: &HashMap<String, String>,
-) -> Result<Option<String>, MicroClawError> {
+fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Option<String>, MicroClawError> {
     let mut backup = None;
     if path.exists() {
         let ts = Utc::now().format("%Y%m%d%H%M%S").to_string();
@@ -877,51 +889,74 @@ fn save_config_yaml(
         backup = Some(backup_path);
     }
 
-    let get = |key: &str| values.get(key).cloned().unwrap_or_default();
+    let get = |key: &str| values.get(key).cloned().unwrap_or_default().trim().to_string();
 
-    let mut yaml = String::new();
-    yaml.push_str("# MicroClaw configuration\n\n");
-    yaml.push_str("# Telegram bot token from @BotFather\n");
-    yaml.push_str(&format!(
-        "telegram_bot_token: \"{}\"\n",
-        get("TELEGRAM_BOT_TOKEN")
-    ));
-    yaml.push_str("# Bot username without @\n");
-    yaml.push_str(&format!("bot_username: \"{}\"\n\n", get("BOT_USERNAME")));
-
-    yaml.push_str(
-        "# LLM provider (anthropic, ollama, openai, openrouter, deepseek, google, etc.)\n",
-    );
-    yaml.push_str(&format!("llm_provider: \"{}\"\n", get("LLM_PROVIDER")));
-    yaml.push_str("# API key for LLM provider\n");
-    yaml.push_str(&format!("api_key: \"{}\"\n", get("LLM_API_KEY")));
-
-    let model = get("LLM_MODEL");
-    if !model.is_empty() {
-        yaml.push_str("# Model name (leave empty for provider default)\n");
-        yaml.push_str(&format!("model: \"{}\"\n", model));
-    }
-
-    let base_url = get("LLM_BASE_URL");
-    if !base_url.is_empty() {
-        yaml.push_str("# Custom base URL (optional)\n");
-        yaml.push_str(&format!("llm_base_url: \"{}\"\n", base_url));
-    }
-
-    yaml.push('\n');
     let workspace_dir = values
-        .get("WORKSPACE_DIR")
+        .get("WORKING_DIR")
+        .or(values.get("WORKSPACE_DIR"))
         .cloned()
-        .unwrap_or_else(|| "./workspace".into());
-    yaml.push_str(&format!("workspace_dir: \"{}\"\n", workspace_dir.trim()));
-    let tz = values
-        .get("TIMEZONE")
-        .cloned()
-        .unwrap_or_else(|| "UTC".into());
-    yaml.push_str(&format!("timezone: \"{}\"\n", tz));
+        .unwrap_or_else(|| "./workspace".into())
+        .trim()
+        .to_string();
+    let workspace_dir = if workspace_dir.is_empty() {
+        "./workspace".into()
+    } else {
+        workspace_dir
+    };
 
-    fs::write(path, yaml)?;
+    let vault_url = get("VAULT_GIT_URL");
+    let shared_dir = Path::new(&workspace_dir).join("shared");
+    let origin_path = shared_dir.join("ORIGIN");
+    if !vault_url.is_empty() {
+        let _ = fs::create_dir_all(&shared_dir);
+        if !origin_path.exists() {
+            let _ = Command::new("git")
+                .args(["clone", &vault_url])
+                .arg(&origin_path)
+                .status();
+        }
+    } else {
+        let _ = fs::create_dir_all(&origin_path);
+    }
+
+    let mut lines = Vec::new();
+    lines.push("# MicroClaw configuration".into());
+    lines.push("".into());
+    lines.push("# Telegram".into());
+    lines.push(format!("TELEGRAM_BOT_TOKEN={}", escape_env(&get("TELEGRAM_BOT_TOKEN"))));
+    lines.push(format!("BOT_USERNAME={}", escape_env(&get("BOT_USERNAME"))));
+    lines.push("".into());
+    lines.push("# LLM (anthropic, ollama, openai, openrouter, deepseek, google, etc.)".into());
+    lines.push(format!("LLM_PROVIDER={}", escape_env(&get("LLM_PROVIDER"))));
+    lines.push(format!("LLM_API_KEY={}", escape_env(&get("LLM_API_KEY"))));
+    if !get("LLM_MODEL").is_empty() {
+        lines.push(format!("LLM_MODEL={}", escape_env(&get("LLM_MODEL"))));
+    }
+    if !get("LLM_BASE_URL").is_empty() {
+        lines.push(format!("LLM_BASE_URL={}", escape_env(&get("LLM_BASE_URL"))));
+    }
+    lines.push("".into());
+    lines.push("# Workspace".into());
+    lines.push(format!("WORKSPACE_DIR={}", escape_env(&workspace_dir)));
+    lines.push(format!("TIMEZONE={}", escape_env(&get("TIMEZONE"))));
+    lines.push("".into());
+    lines.push("# ORIGIN vault (optional). Paths relative to workspace_dir.".into());
+    lines.push("VAULT_ORIGIN_VAULT_PATH=shared/ORIGIN".into());
+    lines.push("VAULT_VECTOR_DB_PATH=shared/vault_db".into());
+    if !vault_url.is_empty() {
+        lines.push(format!("VAULT_ORIGIN_VAULT_REPO={}", escape_env(&vault_url)));
+    }
+    let content = lines.join("\n");
+    fs::write(path, content)?;
     Ok(backup)
+}
+
+fn escape_env(s: &str) -> String {
+    if s.contains(' ') || s.contains('"') || s.contains('#') || s.is_empty() {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
 }
 
 fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
@@ -1127,13 +1162,13 @@ fn try_save(app: &mut SetupApp) {
         .and_then(|_| app.validate_online())
         .and_then(|checks| {
             let values = app.to_env_map();
-            let backup = save_config_yaml(Path::new("microclaw.config.yaml"), &values)?;
+            let backup = save_config_env(Path::new(".env"), &values)?;
             app.backup_path = backup;
             app.completion_summary = checks;
             Ok(())
         }) {
         Ok(_) => {
-            app.status = "Saved microclaw.config.yaml".into();
+            app.status = "Saved .env".into();
             app.completed = true;
         }
         Err(e) => app.status = format!("Cannot save: {e}"),

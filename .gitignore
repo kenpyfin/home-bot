@@ -1,4 +1,7 @@
 /target
+.env
+.env.local
+.env.*.local
 microclaw.config.yaml
 microclaw.config.yaml.*
 microclaw.data/*
@@ -9,3 +12,4 @@ web/node_modules/
 shared/*
 
 .cursorrules
+workspace/*

@@ -217,9 +217,25 @@ if (typeof document !== 'undefined') {
   document.documentElement.setAttribute('data-ui-theme', readUiTheme())
 }
 
+const WEB_AUTH_STORAGE_KEY = 'web_auth_token'
+
+function getStoredAuthToken(): string | null {
+  if (typeof sessionStorage === 'undefined') return null
+  try {
+    const t = sessionStorage.getItem(WEB_AUTH_STORAGE_KEY)
+    return t && t.trim() ? t.trim() : null
+  } catch {
+    return null
+  }
+}
+
 function makeHeaders(options: RequestInit = {}): HeadersInit {
   const headers: Record<string, string> = {
     ...(options.headers as Record<string, string> | undefined),
+  }
+  const token = getStoredAuthToken()
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
   }
   if (options.body && !headers['Content-Type']) {
     headers['Content-Type'] = 'application/json'
@@ -227,14 +243,39 @@ function makeHeaders(options: RequestInit = {}): HeadersInit {
   return headers
 }
 
+export const AUTH_REQUIRED_EVENT = 'web-auth-required'
+
+function messageForFailedResponse(status: number, data: Record<string, unknown>, bodyText?: string): string {
+  if (status === 401) {
+    return 'Unauthorized. Enter the API token (WEB_AUTH_TOKEN from .env).'
+  }
+  if (status === 429) {
+    const serverMsg = String(data.error || data.message || bodyText || '').trim()
+    return serverMsg
+      ? `Too many requests: ${serverMsg} Please wait a moment before sending again.`
+      : 'Too many requests. Please wait a moment before sending again.'
+  }
+  return String(data.error || data.message || bodyText || `HTTP ${status}`)
+}
+
 async function api<T>(
   path: string,
   options: RequestInit = {},
 ): Promise<T> {
   const res = await fetch(path, { ...options, headers: makeHeaders(options) })
-  const data = (await res.json().catch(() => ({}))) as Record<string, unknown>
+  const bodyText = await res.text()
+  let data: Record<string, unknown> = {}
+  try {
+    data = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : {}
+  } catch {
+    data = { message: bodyText || undefined }
+  }
+  if (res.status === 401) {
+    window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
+    throw new Error(messageForFailedResponse(401, data, bodyText))
+  }
   if (!res.ok) {
-    throw new Error(String(data.error || data.message || `HTTP ${res.status}`))
+    throw new Error(messageForFailedResponse(res.status, data, bodyText))
   }
   return data as T
 }
@@ -320,15 +361,39 @@ function extractLatestUserText(messages: readonly ChatModelRunOptions['messages'
     const message = messages[i]
     if (message.role !== 'user') continue
 
-    const text = message.content
-      .map((part) => {
-        if (part.type === 'text') return part.text
-        return ''
-      })
-      .join('\n')
-      .trim()
+    const content = message.content
+    let text: string
 
-    if (text.length > 0) return text
+    if (typeof content === 'string') {
+      text = content.trim()
+    } else if (Array.isArray(content)) {
+      text = content
+        .map((part) => {
+          if (part && typeof part === 'object' && part.type === 'text' && 'text' in part) {
+            return typeof (part as { text?: unknown }).text === 'string' ? (part as { text: string }).text : ''
+          }
+          return ''
+        })
+        .join('\n')
+        .trim()
+    } else if (content && typeof content === 'object' && !Array.isArray(content)) {
+      // Single part object: { type: 'text', text: '...' }
+      const part = content as { type?: string; text?: unknown }
+      if (part.type === 'text' && typeof part.text === 'string') {
+        text = part.text.trim()
+      } else {
+        continue
+      }
+    } else {
+      continue
+    }
+
+    if (text.length > 0) {
+      if (import.meta.env?.DEV && typeof console !== 'undefined' && console.debug) {
+        console.debug('[extractLatestUserText]', text.slice(0, 80) + (text.length > 80 ? '…' : ''))
+      }
+      return text
+    }
   }
   return ''
 }
@@ -530,6 +595,14 @@ function App() {
   const [config, setConfig] = useState<ConfigPayload | null>(null)
   const [configDraft, setConfigDraft] = useState<Record<string, unknown>>({})
   const [saveStatus, setSaveStatus] = useState<string>('')
+  const [authRequired, setAuthRequired] = useState<boolean>(false)
+  const [authTokenInput, setAuthTokenInput] = useState<string>('')
+
+  React.useEffect(() => {
+    const onAuthRequired = () => setAuthRequired(true)
+    window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired)
+    return () => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired)
+  }, [])
 
   const sessionItems = useMemo(() => {
     const map = new Map<string, SessionItem>()
@@ -598,7 +671,7 @@ function App() {
         try {
           if (selectedSessionReadOnly) {
             setStatusText('Read-only channel')
-            throw new Error('This channel is read-only in Web UI. Send messages from the original channel.')
+            throw new Error('This chat is read-only. Switch to a web session or create a new chat to send messages.')
           }
 
           const sendResponse = await api<{ run_id?: string }>('/api/send_stream', {
@@ -626,9 +699,17 @@ function App() {
             signal: options.abortSignal,
           })
 
+          if (streamResponse.status === 401) {
+            window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
+            throw new Error('Unauthorized. Enter the API token (WEB_AUTH_TOKEN from .env).')
+          }
           if (!streamResponse.ok) {
             const text = await streamResponse.text().catch(() => '')
-            throw new Error(text || `HTTP ${streamResponse.status}`)
+            const msg =
+              streamResponse.status === 429
+                ? 'Too many requests. Please wait a moment before sending again.'
+                : messageForFailedResponse(streamResponse.status, { message: text || undefined }, text)
+            throw new Error(msg)
           }
 
           let assistantText = ''
@@ -786,11 +867,6 @@ function App() {
 
   function createSession(): void {
     const currentCount = historyCountBySession[sessionKey] ?? historySeed.length
-    if (currentCount === 0) {
-      setStatusText('Current session is empty. Reuse this session.')
-      return
-    }
-
     const key = makeSessionKey()
     const item: SessionItem = {
       session_key: key,
@@ -805,7 +881,7 @@ function App() {
     setRuntimeNonce((x) => x + 1)
     setReplayNotice('')
     setError('')
-    setStatusText('Idle')
+    setStatusText(currentCount === 0 ? 'New session created.' : 'Idle')
   }
 
   function toggleAppearance(): void {
@@ -1028,8 +1104,36 @@ function App() {
     ? { borderColor: 'color-mix(in srgb, var(--mc-border-soft) 60%, transparent)' }
     : undefined
 
+  function submitAuthToken() {
+    const token = authTokenInput.trim()
+    if (!token) return
+    sessionStorage.setItem(WEB_AUTH_STORAGE_KEY, token)
+    setAuthRequired(false)
+    setAuthTokenInput('')
+    window.location.reload()
+  }
+
   return (
     <Theme appearance={appearance} accentColor={radixAccent as never} grayColor="slate" radius="medium" scaling="100%">
+      <Dialog.Root open={authRequired} onOpenChange={(open) => !open && setAuthRequired(false)}>
+        <Dialog.Content>
+          <Dialog.Title>API token required</Dialog.Title>
+          <Dialog.Description size="2" mb="3">
+            This server requires an API token. Use the same value as <code>WEB_AUTH_TOKEN</code> in your .env.
+          </Dialog.Description>
+          <Flex direction="column" gap="3">
+            <TextField.Root
+              type="password"
+              placeholder="Enter token"
+              value={authTokenInput}
+              onChange={(e) => setAuthTokenInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && submitAuthToken()}
+            />
+            <Button onClick={() => submitAuthToken()}>Continue</Button>
+          </Flex>
+        </Dialog.Content>
+      </Dialog.Root>
+
       <div
         className={
           appearance === 'dark'
@@ -1073,6 +1177,14 @@ function App() {
               </Heading>
             </header>
 
+            {selectedSessionReadOnly ? (
+              <Callout.Root color="amber" size="1" variant="soft" className="mx-3 mt-3">
+                <Callout.Text>
+                  This chat is read-only (linked to Telegram/Discord). Switch to a web session in the sidebar or create a new chat to send messages.
+                </Callout.Text>
+              </Callout.Root>
+            ) : null}
+
             <div
               className={
                 appearance === 'dark'
@@ -1104,7 +1216,7 @@ function App() {
           <Dialog.Content maxWidth="760px">
             <Dialog.Title>Runtime Config</Dialog.Title>
             <Dialog.Description size="2" mb="3">
-              Save writes to microclaw.config.yaml. Restart is required.
+              Save writes to .env. Restart may be required.
             </Dialog.Description>
             {config ? (
               <Flex direction="column" gap="4">

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
+use std::path::Path;
 use tracing::info;
 
 use crate::claude::ToolDefinition;
@@ -12,9 +13,18 @@ pub struct ActivateSkillTool {
 }
 
 impl ActivateSkillTool {
+    /// Create with a single skills directory.
     pub fn new(skills_dir: &str) -> Self {
         ActivateSkillTool {
             skill_manager: SkillManager::from_skills_dir(skills_dir),
+        }
+    }
+
+    /// Create with multiple skills directories (e.g. workspace/skills and workspace/shared/skills)
+    /// so skills created by any persona are discoverable by all.
+    pub fn new_with_dirs(dirs: impl IntoIterator<Item = impl AsRef<Path>>) -> Self {
+        ActivateSkillTool {
+            skill_manager: SkillManager::from_skills_dirs(dirs),
         }
     }
 }

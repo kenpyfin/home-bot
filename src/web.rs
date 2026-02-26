@@ -419,7 +419,7 @@ struct UpdateConfigRequest {
 fn config_path_for_save() -> Result<PathBuf, (StatusCode, String)> {
     match Config::resolve_config_path() {
         Ok(Some(path)) => Ok(path),
-        Ok(None) => Ok(PathBuf::from("./microclaw.config.yaml")),
+        Ok(None) => Ok(PathBuf::from("./.env")),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
@@ -551,7 +551,7 @@ async fn api_update_config(
     }
 
     let path = config_path_for_save()?;
-    cfg.save_yaml(&path.to_string_lossy())
+    cfg.save_env(&path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({
@@ -820,12 +820,12 @@ async fn api_send_stream(
                             )
                             .await;
                     }
-                    AgentEvent::ToolStart { name } => {
+                    AgentEvent::ToolStart { name, input } => {
                         run_hub
                             .publish(
                                 &run_id_for_events,
                                 "tool_start",
-                                json!({"name": name}).to_string(),
+                                json!({"name": name, "input": input}).to_string(),
                                 run_history_limit,
                             )
                             .await;
@@ -1103,9 +1103,9 @@ async fn send_and_store_response_with_events(
                 crate::persona::handle_persona_command(state.app_state.db.clone(), chat_id, text.trim(), Some(&state.app_state.config)).await
             }
             SlashCommand::Schedule => {
-                let tasks = call_blocking(state.app_state.db.clone(), move |db| db.get_tasks_for_chat(chat_id)).await;
+                let tasks = call_blocking(state.app_state.db.clone(), |db| db.get_all_scheduled_tasks_for_display()).await;
                 match &tasks {
-                    Ok(t) => crate::tools::schedule::format_tasks_list(t),
+                    Ok(t) => crate::tools::schedule::format_tasks_list_all(t),
                     Err(e) => format!("Error listing tasks: {e}"),
                 }
             }
@@ -1797,6 +1797,7 @@ mod tests {
                         id: "tool_1".into(),
                         name: "glob".into(),
                         input: json!({"pattern": "*.rs", "path": "."}),
+                        thought_signature: None,
                     }],
                     stop_reason: Some("tool_use".into()),
                     usage: None,
@@ -1858,6 +1859,8 @@ mod tests {
             cursor_agent_timeout_secs: 600,
             social: None,
             vault: None,
+            orchestrator_enabled: true,
+            orchestrator_model: String::new(),
         };
         let dir = std::env::temp_dir().join(format!("microclaw_webtest_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1871,7 +1874,13 @@ mod tests {
             bot: bot.clone(),
             db: db.clone(),
             memory: MemoryManager::new(&runtime_dir, cfg.working_dir()),
-            skills: SkillManager::from_skills_dir(&cfg.skills_data_dir()),
+            skills: {
+                let root = cfg.workspace_root_absolute();
+                SkillManager::from_skills_dirs([
+                    root.join("skills"),
+                    root.join("shared").join("skills"),
+                ])
+            },
             llm,
             tools: ToolRegistry::new(&cfg, bot, db),
         };
@@ -1928,6 +1937,53 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("event: delta"));
         assert!(text.contains("event: done"));
+    }
+
+    #[tokio::test]
+    async fn test_slash_command_via_send_stream_returns_done_with_response() {
+        let web_state = test_web_state(Box::new(DummyLlm), None, WebLimits::default());
+        let app = build_router(web_state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/send_stream")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"session_key":"main","sender_name":"u","message":"/reset"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let run_id = v.get("run_id").and_then(|x| x.as_str()).unwrap();
+
+        let req_stream = Request::builder()
+            .method("GET")
+            .uri(format!("/api/stream?run_id={run_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp_stream = app.oneshot(req_stream).await.unwrap();
+        assert_eq!(resp_stream.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp_stream.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+
+        assert!(
+            text.contains("event: done"),
+            "stream should contain event: done"
+        );
+        assert!(
+            text.contains("Conversation cleared"),
+            "done event should contain slash command response"
+        );
+        assert!(
+            !text.contains("event: delta"),
+            "slash command should return only in done, no deltas"
+        );
     }
 
     #[tokio::test]

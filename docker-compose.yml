@@ -1,38 +1,48 @@
+# Workspace: mount host ./workspace as /app/workspace; MICROCLAW_WORKSPACE_DIR points there.
+# Config: copy .env.example to .env and fill in values. Run: microclaw setup
 services:
   microclaw:
     build: .
     container_name: microclaw
+    env_file: .env
     volumes:
-      - ./microclaw.config.yaml:/app/microclaw.config.yaml:ro
-      - ./tmp:/app/tmp
+      - ./.env:/app/.env:ro
+      - ./workspace:/app/workspace
     environment:
-      - MICROCLAW_CONFIG=/app/microclaw.config.yaml
+      - MICROCLAW_CONFIG=/app/.env
+      - MICROCLAW_WORKSPACE_DIR=/app/workspace
+      - HOME=/root
     ports:
       - "10961:10961"
     shm_size: "1gb"
     restart: unless-stopped
 
   # Optional: sync ORIGIN vault from git every 15 minutes.
-  # Set ORIGIN_VAULT_REPO in .env to enable. Run: docker compose --profile sync up -d
+  # Set VAULT_ORIGIN_VAULT_REPO in .env to enable; then: docker compose --profile sync up -d
   sync:
     image: alpine:3.19
     container_name: microclaw-sync
     working_dir: /app
+    env_file: .env
     volumes:
-      - ./tmp:/app/tmp
+      - ./workspace:/app/workspace
     environment:
-      - ORIGIN_VAULT_PATH=/app/tmp/shared/ORIGIN
-      - ORIGIN_VAULT_REPO=${ORIGIN_VAULT_REPO:-}
+      - ORIGIN_VAULT_PATH=/app/workspace/shared/ORIGIN
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         apk add --no-cache git
-        VAULT="$${ORIGIN_VAULT_PATH:-/app/tmp/shared/ORIGIN}"
+        export HOME=$${HOME:-/root}
+        if [ -n "$${GIT_USERNAME:-}" ] && [ -n "$${GIT_TOKEN:-}" ]; then
+          git config --global credential.helper '!f() { echo "username=$$GIT_USERNAME"; echo "password=$$GIT_TOKEN"; }; f'
+        fi
+        VAULT="$${ORIGIN_VAULT_PATH:-/app/workspace/shared/ORIGIN}"
+        REPO="$${VAULT_ORIGIN_VAULT_REPO:-}"
         while true; do
-          if [ -n "$${ORIGIN_VAULT_REPO}" ]; then
+          if [ -n "$$REPO" ]; then
             if [ ! -d "$$VAULT/.git" ]; then
               mkdir -p "$$(dirname "$$VAULT")"
-              git clone "$$ORIGIN_VAULT_REPO" "$$VAULT" 2>/dev/null || true
+              git clone "$$REPO" "$$VAULT" 2>/dev/null || true
             else
               (cd "$$VAULT" && git pull --rebase) 2>/dev/null || true
             fi

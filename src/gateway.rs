@@ -189,11 +189,8 @@ fn resolve_config_path(cwd: &Path) -> Option<PathBuf> {
         });
     }
 
-    for candidate in ["microclaw.config.yaml", "microclaw.config.yml"] {
-        let path = cwd.join(candidate);
-        if path.exists() {
-            return Some(path);
-        }
+    if cwd.join(".env").exists() {
+        return Some(cwd.join(".env"));
     }
     None
 }

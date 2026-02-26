@@ -1,6 +1,7 @@
 pub mod builtin_skills;
 pub mod channel;
 pub mod channels;
+pub mod orchestrator;
 pub mod persona;
 pub mod slash_commands;
 pub mod claude;

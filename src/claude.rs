@@ -27,6 +27,9 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Preserved from Gemini etc. for next request; use skip value if missing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
@@ -80,6 +83,9 @@ pub enum ResponseContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// From API (e.g. Gemini); preserve and send back in next request.
+        #[serde(default)]
+        thought_signature: Option<String>,
     },
 }
 
@@ -111,6 +117,7 @@ mod tests {
             id: "id_123".into(),
             name: "bash".into(),
             input: json!({"command": "ls"}),
+            thought_signature: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "tool_use");
@@ -201,7 +208,12 @@ mod tests {
         });
         let block: ResponseContentBlock = serde_json::from_value(json).unwrap();
         match block {
-            ResponseContentBlock::ToolUse { id, name, input } => {
+            ResponseContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature: _,
+            } => {
                 assert_eq!(id, "tu_abc");
                 assert_eq!(name, "bash");
                 assert_eq!(input["command"], "echo hi");

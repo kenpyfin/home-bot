@@ -98,6 +98,14 @@ fn default_cursor_agent_timeout_secs() -> u64 {
     600
 }
 
+fn default_orchestrator_enabled() -> bool {
+    true
+}
+
+fn default_orchestrator_model() -> String {
+    String::new()
+}
+
 fn is_local_web_host(host: &str) -> bool {
     let h = host.trim().to_ascii_lowercase();
     h == "127.0.0.1" || h == "localhost" || h == "::1"
@@ -131,6 +139,9 @@ pub struct VaultConfig {
     /// ChromaDB persistence dir relative to workspace_dir (e.g. "shared/vault_db").
     #[serde(default)]
     pub vector_db_path: Option<String>,
+    /// Git repo URL to clone/pull vault (for sync service). Env: VAULT_ORIGIN_VAULT_REPO or VAULT_GIT_URL.
+    #[serde(default)]
+    pub origin_vault_repo: Option<String>,
     /// Embedding server URL (e.g. "http://10.0.1.211:8080" for llama.cpp).
     #[serde(default)]
     pub embedding_server_url: Option<String>,
@@ -143,6 +154,12 @@ pub struct VaultConfig {
     /// Override principles file path relative to workspace_dir (e.g. "shared/ORIGIN/AGENTS.md"). Default: "AGENTS.md" at workspace root.
     #[serde(default)]
     pub principles_path: Option<String>,
+    /// ChromaDB HTTP server URL (e.g. "http://localhost:8000"). Required for the native search_vault tool.
+    #[serde(default)]
+    pub vector_db_url: Option<String>,
+    /// ChromaDB collection name (default: "vault").
+    #[serde(default)]
+    pub vector_db_collection: Option<String>,
 }
 
 impl SocialConfig {
@@ -263,6 +280,12 @@ pub struct Config {
     /// Optional vault/vector DB config for ORIGIN Obsidian vault integration.
     #[serde(default)]
     pub vault: Option<VaultConfig>,
+    /// Enable plan-first orchestrator: run planning step before main agent loop.
+    #[serde(default = "default_orchestrator_enabled")]
+    pub orchestrator_enabled: bool,
+    /// Optional model override for orchestrator (e.g. faster/cheaper). If empty, use main model.
+    #[serde(default = "default_orchestrator_model")]
+    pub orchestrator_model: String,
 }
 
 impl Config {
@@ -309,44 +332,245 @@ impl Config {
         }
     }
 
+    /// Resolve path to .env file. MICROCLAW_CONFIG can override (points to .env).
     pub fn resolve_config_path() -> Result<Option<PathBuf>, MicroClawError> {
-        // 1. Check MICROCLAW_CONFIG env var for custom path
         if let Ok(custom) = std::env::var("MICROCLAW_CONFIG") {
-            if std::path::Path::new(&custom).exists() {
+            let p = std::path::Path::new(&custom);
+            if p.exists() {
                 return Ok(Some(PathBuf::from(custom)));
             }
             return Err(MicroClawError::Config(format!(
                 "MICROCLAW_CONFIG points to non-existent file: {custom}"
             )));
         }
-
-        if std::path::Path::new("./microclaw.config.yaml").exists() {
-            return Ok(Some(PathBuf::from("./microclaw.config.yaml")));
-        }
-        if std::path::Path::new("./microclaw.config.yml").exists() {
-            return Ok(Some(PathBuf::from("./microclaw.config.yml")));
+        if std::path::Path::new("./.env").exists() {
+            return Ok(Some(PathBuf::from("./.env")));
         }
         Ok(None)
     }
 
-    /// Load config from YAML file.
-    pub fn load() -> Result<Self, MicroClawError> {
-        let yaml_path = Self::resolve_config_path()?;
+    fn env(key: &str) -> Option<String> {
+        std::env::var(key).ok().and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
+    }
 
-        if let Some(path) = yaml_path {
-            let path_str = path.to_string_lossy().to_string();
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| MicroClawError::Config(format!("Failed to read {path_str}: {e}")))?;
-            let mut config: Config = serde_yaml::from_str(&content)
-                .map_err(|e| MicroClawError::Config(format!("Failed to parse {path_str}: {e}")))?;
-            config.post_deserialize()?;
-            return Ok(config);
+    fn env_u32(key: &str, default: u32) -> u32 {
+        Self::env(key)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_u64(key: &str, default: u64) -> u64 {
+        Self::env(key)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_usize(key: &str, default: usize) -> usize {
+        Self::env(key)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_u16(key: &str, default: u16) -> u16 {
+        Self::env(key)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_bool(key: &str, default: bool) -> bool {
+        match Self::env(key).as_deref().map(|s| s.to_lowercase()) {
+            Some(s) => match s.as_str() {
+                "1" | "true" | "yes" => true,
+                "0" | "false" | "no" => false,
+                _ => default,
+            },
+            None => default,
+        }
+    }
+
+    fn env_vec_i64(key: &str) -> Vec<i64> {
+        Self::env(key)
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|p| p.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn env_vec_u64(key: &str) -> Vec<u64> {
+        Self::env(key)
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|p| p.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Load config from environment (.env file + process env). Load .env from MICROCLAW_CONFIG path or ./
+    pub fn load() -> Result<Self, MicroClawError> {
+        let env_path = Self::resolve_config_path()?;
+        let load_path = env_path.as_deref().unwrap_or(std::path::Path::new("./.env"));
+        if load_path.exists() {
+            dotenvy::from_path(load_path)
+                .map_err(|e| MicroClawError::Config(format!("Failed to load .env: {e}")))?;
+        } else if env_path.is_none() {
+            return Err(MicroClawError::Config(
+                "No .env found. Run `microclaw setup` to create one.".into(),
+            ));
         }
 
-        // No config file found at all
-        Err(MicroClawError::Config(
-            "No microclaw.config.yaml found. Run `microclaw config` to create one.".into(),
-        ))
+        let mut config = Self::load_from_env();
+        config.post_deserialize()?;
+        Ok(config)
+    }
+
+    /// Load config from a specific .env file path (e.g. for config wizard).
+    pub fn load_from_path(path: &std::path::Path) -> Result<Self, MicroClawError> {
+        if path.exists() {
+            dotenvy::from_path(path)
+                .map_err(|e| MicroClawError::Config(format!("Failed to load .env: {e}")))?;
+        }
+        let mut config = Self::load_from_env();
+        config.post_deserialize()?;
+        Ok(config)
+    }
+
+    /// Build Config from current environment (after dotenvy has loaded .env).
+    fn load_from_env() -> Self {
+        let vault = {
+            let has_vault = Self::env("VAULT_ORIGIN_VAULT_PATH").is_some()
+                || Self::env("VAULT_VECTOR_DB_PATH").is_some()
+                || Self::env("VAULT_ORIGIN_VAULT_REPO").is_some()
+                || Self::env("VAULT_GIT_URL").is_some()
+                || Self::env("VAULT_EMBEDDING_SERVER_URL").is_some()
+                || Self::env("VAULT_VECTOR_DB_URL").is_some();
+            if has_vault {
+                Some(VaultConfig {
+                    origin_vault_path: Self::env("VAULT_ORIGIN_VAULT_PATH"),
+                    vector_db_path: Self::env("VAULT_VECTOR_DB_PATH"),
+                    origin_vault_repo: Self::env("VAULT_ORIGIN_VAULT_REPO")
+                        .or_else(|| Self::env("VAULT_GIT_URL")),
+                    embedding_server_url: Self::env("VAULT_EMBEDDING_SERVER_URL"),
+                    vault_search_command: Self::env("VAULT_SEARCH_COMMAND"),
+                    vault_index_command: Self::env("VAULT_INDEX_COMMAND"),
+                    principles_path: Self::env("VAULT_PRINCIPLES_PATH"),
+                    vector_db_url: Self::env("VAULT_VECTOR_DB_URL"),
+                    vector_db_collection: Self::env("VAULT_VECTOR_DB_COLLECTION"),
+                })
+            } else {
+                None
+            }
+        };
+
+        let social = {
+            let has_social = Self::env("SOCIAL_BASE_URL").is_some()
+                || Self::env("SOCIAL_TIKTOK_CLIENT_ID").is_some()
+                || Self::env("SOCIAL_INSTAGRAM_CLIENT_ID").is_some()
+                || Self::env("SOCIAL_LINKEDIN_CLIENT_ID").is_some();
+            if has_social {
+                Some(SocialConfig {
+                    base_url: Self::env("SOCIAL_BASE_URL"),
+                    tiktok: SocialPlatformConfig {
+                        client_id: Self::env("SOCIAL_TIKTOK_CLIENT_ID"),
+                        client_secret: Self::env("SOCIAL_TIKTOK_CLIENT_SECRET"),
+                    },
+                    instagram: SocialPlatformConfig {
+                        client_id: Self::env("SOCIAL_INSTAGRAM_CLIENT_ID"),
+                        client_secret: Self::env("SOCIAL_INSTAGRAM_CLIENT_SECRET"),
+                    },
+                    linkedin: SocialPlatformConfig {
+                        client_id: Self::env("SOCIAL_LINKEDIN_CLIENT_ID"),
+                        client_secret: Self::env("SOCIAL_LINKEDIN_CLIENT_SECRET"),
+                    },
+                })
+            } else {
+                None
+            }
+        };
+
+        Config {
+            telegram_bot_token: Self::env("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
+            bot_username: Self::env("BOT_USERNAME").unwrap_or_default(),
+            llm_provider: Self::env("LLM_PROVIDER").unwrap_or_else(default_llm_provider),
+            api_key: Self::env("LLM_API_KEY").unwrap_or_else(default_api_key),
+            model: Self::env("LLM_MODEL").unwrap_or_default(),
+            llm_base_url: Self::env("LLM_BASE_URL"),
+            max_tokens: Self::env_u32("MAX_TOKENS", default_max_tokens()),
+            max_tool_iterations: Self::env_usize("MAX_TOOL_ITERATIONS", default_max_tool_iterations()),
+            max_history_messages: Self::env_usize("MAX_HISTORY_MESSAGES", default_max_history_messages()),
+            max_document_size_mb: Self::env_u64("MAX_DOCUMENT_SIZE_MB", default_max_document_size_mb()),
+            workspace_dir: Self::env("WORKSPACE_DIR")
+                .unwrap_or_else(default_workspace_dir),
+            openai_api_key: Self::env("OPENAI_API_KEY"),
+            timezone: Self::env("TIMEZONE").unwrap_or_else(default_timezone),
+            allowed_groups: Self::env_vec_i64("ALLOWED_GROUPS"),
+            control_chat_ids: Self::env_vec_i64("CONTROL_CHAT_IDS"),
+            max_session_messages: Self::env_usize("MAX_SESSION_MESSAGES", default_max_session_messages()),
+            compact_keep_recent: Self::env_usize("COMPACT_KEEP_RECENT", default_compact_keep_recent()),
+            whatsapp_access_token: Self::env("WHATSAPP_ACCESS_TOKEN"),
+            whatsapp_phone_number_id: Self::env("WHATSAPP_PHONE_NUMBER_ID"),
+            whatsapp_verify_token: Self::env("WHATSAPP_VERIFY_TOKEN"),
+            whatsapp_webhook_port: Self::env_u16("WHATSAPP_WEBHOOK_PORT", default_whatsapp_webhook_port()),
+            discord_bot_token: Self::env("DISCORD_BOT_TOKEN"),
+            discord_allowed_channels: Self::env_vec_u64("DISCORD_ALLOWED_CHANNELS"),
+            show_thinking: Self::env_bool("SHOW_THINKING", false),
+            web_enabled: Self::env_bool("WEB_ENABLED", default_web_enabled()),
+            web_host: Self::env("WEB_HOST").unwrap_or_else(default_web_host),
+            web_port: Self::env_u16("WEB_PORT", default_web_port()),
+            web_auth_token: Self::env("WEB_AUTH_TOKEN"),
+            web_max_inflight_per_session: Self::env_usize(
+                "WEB_MAX_INFLIGHT_PER_SESSION",
+                default_web_max_inflight_per_session(),
+            ),
+            web_max_requests_per_window: Self::env_usize(
+                "WEB_MAX_REQUESTS_PER_WINDOW",
+                default_web_max_requests_per_window(),
+            ),
+            web_rate_window_seconds: Self::env_u64(
+                "WEB_RATE_WINDOW_SECONDS",
+                default_web_rate_window_seconds(),
+            ),
+            web_run_history_limit: Self::env_usize(
+                "WEB_RUN_HISTORY_LIMIT",
+                default_web_run_history_limit(),
+            ),
+            web_session_idle_ttl_seconds: Self::env_u64(
+                "WEB_SESSION_IDLE_TTL_SECONDS",
+                default_web_session_idle_ttl_seconds(),
+            ),
+            browser_managed: Self::env_bool("BROWSER_MANAGED", default_browser_managed()),
+            browser_executable_path: Self::env("BROWSER_EXECUTABLE_PATH"),
+            browser_cdp_port_base: Self::env_u16(
+                "BROWSER_CDP_PORT_BASE",
+                default_browser_cdp_port_base(),
+            ),
+            browser_idle_timeout_secs: Self::env("BROWSER_IDLE_TIMEOUT_SECS").and_then(|s| s.parse().ok()),
+            browser_headless: Self::env_bool("BROWSER_HEADLESS", default_browser_headless()),
+            agent_browser_path: Self::env("AGENT_BROWSER_PATH"),
+            cursor_agent_cli_path: Self::env("CURSOR_AGENT_CLI_PATH")
+                .unwrap_or_else(default_cursor_agent_cli_path),
+            cursor_agent_model: Self::env("CURSOR_AGENT_MODEL").unwrap_or_default(),
+            cursor_agent_timeout_secs: Self::env_u64(
+                "CURSOR_AGENT_TIMEOUT_SECS",
+                default_cursor_agent_timeout_secs(),
+            ),
+            social,
+            vault,
+            orchestrator_enabled: Self::env_bool(
+                "ORCHESTRATOR_ENABLED",
+                default_orchestrator_enabled(),
+            ),
+            orchestrator_model: Self::env("ORCHESTRATOR_MODEL").unwrap_or_default(),
+        }
     }
 
     /// Apply post-deserialization normalization and validation.
@@ -358,6 +582,7 @@ impl Config {
             self.model = match self.llm_provider.as_str() {
                 "anthropic" => "claude-sonnet-4-5-20250929".into(),
                 "ollama" => "llama3.2".into(),
+                "google" => "gemini-2.5-flash".into(),
                 _ => "gpt-5.2".into(),
             };
         }
@@ -371,6 +596,12 @@ impl Config {
         if let Some(ref url) = self.llm_base_url {
             if url.trim().is_empty() {
                 self.llm_base_url = None;
+            }
+        }
+        if let Ok(dir) = std::env::var("MICROCLAW_WORKSPACE_DIR") {
+            let trimmed = dir.trim();
+            if !trimmed.is_empty() {
+                self.workspace_dir = trimmed.to_string();
             }
         }
         if self.workspace_dir.trim().is_empty() {
@@ -453,12 +684,64 @@ impl Config {
         Ok(())
     }
 
-    /// Save config as YAML to the given path.
+    /// Save config as YAML to the given path (legacy; prefer save_env).
     #[allow(dead_code)]
     pub fn save_yaml(&self, path: &str) -> Result<(), MicroClawError> {
         let content = serde_yaml::to_string(self)
             .map_err(|e| MicroClawError::Config(format!("Failed to serialize config: {e}")))?;
         std::fs::write(path, content)?;
+        Ok(())
+    }
+
+    /// Save config as .env to the given path.
+    pub fn save_env(&self, path: &std::path::Path) -> Result<(), MicroClawError> {
+        fn esc(s: &str) -> String {
+            if s.contains(' ') || s.contains('"') || s.contains('#') || s.is_empty() {
+                format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+            } else {
+                s.to_string()
+            }
+        }
+        let mut lines = Vec::new();
+        lines.push("# MicroClaw configuration".into());
+        lines.push("".into());
+        lines.push("# Telegram".into());
+        lines.push(format!("TELEGRAM_BOT_TOKEN={}", esc(&self.telegram_bot_token)));
+        lines.push(format!("BOT_USERNAME={}", esc(&self.bot_username)));
+        lines.push("".into());
+        lines.push("# LLM".into());
+        lines.push(format!("LLM_PROVIDER={}", esc(&self.llm_provider)));
+        lines.push(format!("LLM_API_KEY={}", esc(&self.api_key)));
+        if !self.model.is_empty() {
+            lines.push(format!("LLM_MODEL={}", esc(&self.model)));
+        }
+        if let Some(ref u) = self.llm_base_url {
+            if !u.is_empty() {
+                lines.push(format!("LLM_BASE_URL={}", esc(u)));
+            }
+        }
+        lines.push("".into());
+        lines.push("# Workspace".into());
+        lines.push(format!("WORKSPACE_DIR={}", esc(&self.workspace_dir)));
+        lines.push(format!("TIMEZONE={}", esc(&self.timezone)));
+        if let Some(ref v) = self.vault {
+            lines.push("".into());
+            lines.push("# ORIGIN vault".into());
+            lines.push(format!(
+                "VAULT_ORIGIN_VAULT_PATH={}",
+                esc(v.origin_vault_path.as_deref().unwrap_or("shared/ORIGIN"))
+            ));
+            lines.push(format!(
+                "VAULT_VECTOR_DB_PATH={}",
+                esc(v.vector_db_path.as_deref().unwrap_or("shared/vault_db"))
+            ));
+            if let Some(ref r) = v.origin_vault_repo {
+                if !r.is_empty() {
+                    lines.push(format!("VAULT_ORIGIN_VAULT_REPO={}", esc(r)));
+                }
+            }
+        }
+        std::fs::write(path, lines.join("\n"))?;
         Ok(())
     }
 }
@@ -513,6 +796,8 @@ mod tests {
             cursor_agent_timeout_secs: 600,
             social: None,
             vault: None,
+            orchestrator_enabled: true,
+            orchestrator_model: String::new(),
         }
     }
 

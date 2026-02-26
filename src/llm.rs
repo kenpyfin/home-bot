@@ -6,6 +6,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use std::collections::HashSet;
+use uuid::Uuid;
 
 use crate::claude::{
     ContentBlock, ImageSource, Message, MessageContent, MessagesRequest, MessagesResponse,
@@ -178,6 +179,7 @@ pub trait LlmProvider: Send + Sync {
 pub fn create_provider(config: &Config) -> Box<dyn LlmProvider> {
     match config.llm_provider.trim().to_lowercase().as_str() {
         "anthropic" => Box::new(AnthropicProvider::new(config)),
+        "google" | "gemini" => Box::new(GeminiProvider::new(config)),
         _ => Box::new(OpenAiProvider::new(config)),
     }
 }
@@ -317,6 +319,7 @@ struct StreamToolUseBlock {
     id: String,
     name: String,
     input_json: String,
+    thought_signature: Option<String>,
 }
 
 fn usage_from_json(v: &serde_json::Value) -> Option<Usage> {
@@ -391,6 +394,11 @@ fn process_anthropic_stream_event(
                                     id,
                                     name,
                                     input_json,
+                                    thought_signature: block
+                                        .get("thought_signature")
+                                        .or_else(|| block.get("thoughtSignature"))
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from),
                                 },
                             );
                         }
@@ -514,12 +522,20 @@ fn process_openai_stream_event(
             if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                 entry.id = id.to_string();
             }
+            if let Some(s) = tc.get("thought_signature").or_else(|| tc.get("thoughtSignature")).and_then(|v| v.as_str()) {
+                entry.thought_signature = Some(s.to_string());
+            }
             if let Some(function) = tc.get("function") {
                 if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
                     entry.name = name.to_string();
                 }
                 if let Some(args) = function.get("arguments").and_then(|v| v.as_str()) {
                     entry.input_json.push_str(args);
+                }
+                if entry.thought_signature.is_none() {
+                    if let Some(s) = function.get("thought_signature").or_else(|| function.get("thoughtSignature")).and_then(|v| v.as_str()) {
+                        entry.thought_signature = Some(s.to_string());
+                    }
                 }
             }
         }
@@ -562,6 +578,7 @@ fn build_stream_response(
                 id: tool.id.clone(),
                 name: tool.name.clone(),
                 input: parse_tool_input(&tool.input_json),
+                thought_signature: tool.thought_signature.clone(),
             });
         }
     }
@@ -732,12 +749,16 @@ struct OaiMessage {
 struct OaiToolCall {
     id: String,
     function: OaiFunction,
+    #[serde(default, alias = "thoughtSignature")]
+    thought_signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OaiFunction {
     name: String,
     arguments: String,
+    #[serde(default, alias = "thoughtSignature")]
+    thought_signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -944,6 +965,7 @@ impl LlmProvider for OpenAiProvider {
                 id: tool.id,
                 name: tool.name,
                 input: parse_tool_input(&tool.input_json),
+                thought_signature: tool.thought_signature,
             });
         }
         if content.is_empty() {
@@ -961,11 +983,531 @@ impl LlmProvider for OpenAiProvider {
 }
 
 // ---------------------------------------------------------------------------
+// Google Gemini native provider
+// ---------------------------------------------------------------------------
+
+pub struct GeminiProvider {
+    http: reqwest::Client,
+    api_key: String,
+    model: String,
+    max_tokens: u32,
+}
+
+impl GeminiProvider {
+    pub fn new(config: &Config) -> Self {
+        GeminiProvider {
+            http: reqwest::Client::new(),
+            api_key: config.api_key.clone(),
+            model: config.model.clone(),
+            max_tokens: config.max_tokens,
+        }
+    }
+
+    fn generate_url(&self) -> String {
+        format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            self.model, self.api_key
+        )
+    }
+
+    fn stream_url(&self) -> String {
+        format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
+            self.model, self.api_key
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiError {
+    error: GeminiErrorDetail,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiErrorDetail {
+    code: i32,
+    message: String,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[async_trait]
+impl LlmProvider for GeminiProvider {
+    async fn send_message(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<MessagesResponse, MicroClawError> {
+        let messages = sanitize_messages(messages);
+        let request_body = build_gemini_request(system, &messages, tools, self.max_tokens);
+
+        let mut retries = 0u32;
+        let max_retries = 3;
+
+        loop {
+            let response = self
+                .http
+                .post(&self.generate_url())
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .send()
+                .await?;
+
+            let status = response.status();
+
+            if status.is_success() {
+                let body = response.text().await?;
+                return parse_gemini_response(&body);
+            }
+
+            if status.as_u16() == 429 && retries < max_retries {
+                retries += 1;
+                let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                warn!(
+                    "Rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
+                    delay
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let body = response.text().await.unwrap_or_default();
+            if let Ok(err) = serde_json::from_str::<GeminiError>(&body) {
+                return Err(MicroClawError::LlmApi(format!(
+                    "Gemini API error {}: {}",
+                    err.error.code, err.error.message
+                )));
+            }
+            return Err(MicroClawError::LlmApi(format!("HTTP {status}: {body}")));
+        }
+    }
+
+    async fn send_message_stream(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        text_tx: Option<&UnboundedSender<String>>,
+    ) -> Result<MessagesResponse, MicroClawError> {
+        let messages = sanitize_messages(messages);
+        let request_body = build_gemini_request(system, &messages, tools, self.max_tokens);
+
+        let response = self
+            .http
+            .post(&self.stream_url())
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            if let Ok(err) = serde_json::from_str::<GeminiError>(&text) {
+                return Err(MicroClawError::LlmApi(format!(
+                    "Gemini API error {}: {}",
+                    err.error.code, err.error.message
+                )));
+            }
+            return Err(MicroClawError::LlmApi(format!("HTTP {status}: {text}")));
+        }
+
+        let mut byte_stream = response.bytes_stream();
+        let mut sse = SseEventParser::default();
+        let mut accumulated_text = String::new();
+        let mut tool_calls: Vec<(String, String, serde_json::Value, Option<String>)> = Vec::new();
+        let mut stop_reason: Option<String> = None;
+        let mut usage: Option<Usage> = None;
+
+        while let Some(chunk_res) = byte_stream.next().await {
+            let chunk = match chunk_res {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            for data in sse.push_chunk(&String::from_utf8_lossy(&chunk)) {
+                process_gemini_stream_event(
+                    &data,
+                    text_tx,
+                    &mut accumulated_text,
+                    &mut tool_calls,
+                    &mut stop_reason,
+                    &mut usage,
+                );
+            }
+        }
+        for data in sse.finish() {
+            process_gemini_stream_event(
+                &data,
+                text_tx,
+                &mut accumulated_text,
+                &mut tool_calls,
+                &mut stop_reason,
+                &mut usage,
+            );
+        }
+
+        let has_tool_calls = !tool_calls.is_empty();
+        let mut content = Vec::new();
+        if !accumulated_text.is_empty() {
+            content.push(ResponseContentBlock::Text {
+                text: accumulated_text,
+            });
+        }
+        for (id, name, input, thought_sig) in tool_calls {
+            content.push(ResponseContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature: thought_sig,
+            });
+        }
+        if content.is_empty() {
+            content.push(ResponseContentBlock::Text {
+                text: String::new(),
+            });
+        }
+
+        let final_stop_reason = if has_tool_calls {
+            Some("tool_use".into())
+        } else {
+            stop_reason
+        };
+
+        Ok(MessagesResponse {
+            content,
+            stop_reason: normalize_stop_reason(final_stop_reason),
+            usage,
+        })
+    }
+}
+
+fn process_gemini_stream_event(
+    data: &str,
+    text_tx: Option<&UnboundedSender<String>>,
+    accumulated_text: &mut String,
+    tool_calls: &mut Vec<(String, String, serde_json::Value, Option<String>)>,
+    stop_reason: &mut Option<String>,
+    usage: &mut Option<Usage>,
+) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+        return;
+    };
+
+    if let Some(candidates) = v.get("candidates").and_then(|c| c.as_array()) {
+        if let Some(candidate) = candidates.first() {
+            if let Some(reason) = candidate
+                .get("finishReason")
+                .and_then(|r| r.as_str())
+            {
+                *stop_reason = Some(reason.to_string());
+            }
+
+            if let Some(content) = candidate.get("content") {
+                if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
+                    for part in parts {
+                        // Text parts (skip if thought == true)
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            let is_thought = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
+                            if !is_thought {
+                                accumulated_text.push_str(text);
+                                if let Some(tx) = text_tx {
+                                    let _ = tx.send(text.to_string());
+                                }
+                            }
+                        }
+                        // Function call parts
+                        if let Some(fc) = part.get("functionCall") {
+                            if let (Some(name), Some(args)) =
+                                (fc.get("name").and_then(|n| n.as_str()),
+                                 fc.get("args"))
+                            {
+                                let id = Uuid::new_v4().to_string();
+                                let thought_sig = part
+                                    .get("thoughtSignature")
+                                    .or_else(|| fc.get("thoughtSignature"))
+                                    .and_then(|ts| ts.as_str())
+                                    .map(String::from);
+                                tool_calls.push((id, name.to_string(), args.clone(), thought_sig));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Capture usage from any chunk
+    if usage.is_none() {
+        if let Some(metadata) = v.get("usageMetadata") {
+            *usage = Some(Usage {
+                input_tokens: metadata
+                    .get("promptTokenCount")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0) as u32,
+                output_tokens: metadata
+                    .get("candidatesTokenCount")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0) as u32,
+            });
+        }
+    }
+}
+
+fn build_gemini_request(
+    system: &str,
+    messages: &[Message],
+    tools: Option<Vec<ToolDefinition>>,
+    max_tokens: u32,
+) -> serde_json::Value {
+    let contents = translate_messages_to_gemini(messages);
+    let mut request = json!({
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+        }
+    });
+
+    if !system.is_empty() {
+        request["systemInstruction"] = json!({ "parts": [{ "text": system }] });
+    }
+
+    if let Some(tool_defs) = tools {
+        if !tool_defs.is_empty() {
+            let func_decls: Vec<serde_json::Value> = tool_defs
+                .iter()
+                .map(|t| {
+                    let parameters = sanitize_oai_parameters(&t.input_schema);
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": parameters,
+                    })
+                })
+                .collect();
+            request["tools"] = json!([{ "functionDeclarations": func_decls }]);
+        }
+    }
+
+    request
+}
+
+fn translate_messages_to_gemini(messages: &[Message]) -> Vec<serde_json::Value> {
+    // Build id → name map from all tool_use blocks
+    let mut tool_id_to_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for msg in messages {
+        if msg.role == "assistant" {
+            if let MessageContent::Blocks(blocks) = &msg.content {
+                for block in blocks {
+                    if let ContentBlock::ToolUse { id, name, .. } = block {
+                        tool_id_to_name.insert(id.clone(), name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<serde_json::Value> = Vec::new();
+
+    for msg in messages {
+        let role = if msg.role == "assistant" { "model" } else { "user" };
+
+        match &msg.content {
+            MessageContent::Text(text) => {
+                let content = if text.is_empty() {
+                    GEMINI_MINIMAL_PARTS.to_string()
+                } else {
+                    text.clone()
+                };
+                out.push(json!({
+                    "role": role,
+                    "parts": [{ "text": content }]
+                }));
+            }
+            MessageContent::Blocks(blocks) => {
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            parts.push(json!({ "text": text }));
+                        }
+                        ContentBlock::ToolUse {
+                            name,
+                            input,
+                            thought_signature,
+                            ..
+                        } => {
+                            let sig = thought_signature
+                                .clone()
+                                .unwrap_or_else(|| GEMINI_SKIP_THOUGHT_SIGNATURE.to_string());
+                            let mut part = json!({
+                                "functionCall": {
+                                    "name": name,
+                                    "args": input,
+                                }
+                            });
+                            part["thoughtSignature"] = json!(sig);
+                            parts.push(part);
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => {
+                            // Look up function name
+                            if let Some(fn_name) = tool_id_to_name.get(tool_use_id) {
+                                let response = if is_error == &Some(true) {
+                                    json!({"error": content})
+                                } else {
+                                    json!({"result": content})
+                                };
+                                parts.push(json!({
+                                    "functionResponse": {
+                                        "name": fn_name,
+                                        "response": response,
+                                    }
+                                }));
+                            }
+                        }
+                        ContentBlock::Image { source } => {
+                            parts.push(json!({
+                                "inlineData": {
+                                    "mimeType": source.media_type,
+                                    "data": source.data,
+                                }
+                            }));
+                        }
+                    }
+                }
+
+                if parts.is_empty() {
+                    parts.push(json!({ "text": GEMINI_MINIMAL_PARTS }));
+                }
+
+                out.push(json!({
+                    "role": role,
+                    "parts": parts,
+                }));
+            }
+        }
+    }
+
+    // Ensure first message is "user"
+    if !out.is_empty() {
+        let first_role = out[0].get("role").and_then(|r| r.as_str());
+        if first_role != Some("user") {
+            out.insert(0, json!({"role": "user", "parts": [{"text": GEMINI_MINIMAL_PARTS}]}));
+        }
+    }
+
+    out
+}
+
+fn parse_gemini_response(body: &str) -> Result<MessagesResponse, MicroClawError> {
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| MicroClawError::LlmApi(format!("Failed to parse Gemini response: {e}\nBody: {body}")))?;
+
+    let mut content = Vec::new();
+    let mut stop_reason: Option<String> = None;
+    let mut usage: Option<Usage> = None;
+
+    if let Some(candidates) = v.get("candidates").and_then(|c| c.as_array()) {
+        if let Some(candidate) = candidates.first() {
+            if let Some(reason) = candidate
+                .get("finishReason")
+                .and_then(|r| r.as_str())
+            {
+                stop_reason = Some(reason.to_string());
+            }
+
+            if let Some(parts) = candidate
+                .get("content")
+                .and_then(|c| c.get("parts"))
+                .and_then(|p| p.as_array())
+            {
+                let mut has_tool_calls = false;
+                for part in parts {
+                    // Text parts (skip if thought == true)
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        let is_thought =
+                            part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
+                        if !is_thought && !text.is_empty() {
+                            content.push(ResponseContentBlock::Text {
+                                text: text.to_string(),
+                            });
+                        }
+                    }
+                    // Function call parts
+                    if let Some(fc) = part.get("functionCall") {
+                        has_tool_calls = true;
+                        if let (Some(name), Some(args)) =
+                            (fc.get("name").and_then(|n| n.as_str()),
+                             fc.get("args"))
+                        {
+                            let id = Uuid::new_v4().to_string();
+                            let thought_sig = part
+                                .get("thoughtSignature")
+                                .or_else(|| fc.get("thoughtSignature"))
+                                .and_then(|ts| ts.as_str())
+                                .map(String::from);
+                            content.push(ResponseContentBlock::ToolUse {
+                                id,
+                                name: name.to_string(),
+                                input: args.clone(),
+                                thought_signature: thought_sig,
+                            });
+                        }
+                    }
+                }
+
+                // Override stop_reason if tool calls present
+                if has_tool_calls {
+                    stop_reason = Some("tool_use".into());
+                }
+            }
+        }
+    }
+
+    // Capture usage
+    if let Some(metadata) = v.get("usageMetadata") {
+        usage = Some(Usage {
+            input_tokens: metadata
+                .get("promptTokenCount")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0) as u32,
+            output_tokens: metadata
+                .get("candidatesTokenCount")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0) as u32,
+        });
+    }
+
+    if content.is_empty() {
+        content.push(ResponseContentBlock::Text {
+            text: String::new(),
+        });
+    }
+
+    Ok(MessagesResponse {
+        content,
+        stop_reason: normalize_stop_reason(stop_reason),
+        usage,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Format translation helpers  (internal Anthropic-style ↔ OpenAI)
 // ---------------------------------------------------------------------------
 
 /// Minimal non-whitespace content so Vertex AI / Gemini gateways never treat the prompt as "no parts".
 const GEMINI_MINIMAL_PARTS: &str = ".";
+
+/// When Gemini returns a functionCall without thoughtSignature, or we cannot preserve it (e.g. after
+/// session load), use this dummy value so Gemini skips signature validation. Using a random UUID
+/// would cause "Corrupted thought signature" because Gemini expects the exact signature it returned.
+const GEMINI_SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
 
 fn translate_messages_to_oai(system: &str, messages: &[Message]) -> Vec<serde_json::Value> {
     // Collect all tool_use IDs present in assistant messages so we can
@@ -1018,14 +1560,34 @@ fn translate_messages_to_oai(system: &str, messages: &[Message]) -> Vec<serde_js
                     let tool_calls: Vec<serde_json::Value> = blocks
                         .iter()
                         .filter_map(|b| match b {
-                            ContentBlock::ToolUse { id, name, input } => Some(json!({
-                                "id": id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": serde_json::to_string(input).unwrap_or_default()
-                                }
-                            })),
+                            ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input,
+                                thought_signature,
+                            } => {
+                                let args = serde_json::to_string(input).unwrap_or_default();
+                                // Gemini requires thought_signature in function calls. Use preserved
+                                // signature if available; otherwise use skip value to avoid "Corrupted
+                                // thought signature" (a random UUID would fail validation).
+                                let sig = thought_signature
+                                    .clone()
+                                    .unwrap_or_else(|| GEMINI_SKIP_THOUGHT_SIGNATURE.to_string());
+
+                                let tool_call = json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": args,
+                                        "thought_signature": &sig,
+                                        "thoughtSignature": &sig,
+                                    },
+                                    "thought_signature": &sig,
+                                    "thoughtSignature": &sig,
+                                });
+                                Some(tool_call)
+                            }
                             _ => None,
                         })
                         .collect();
@@ -1255,10 +1817,15 @@ fn translate_oai_response(oai: OaiResponse) -> MessagesResponse {
         for tc in tool_calls {
             let input: serde_json::Value =
                 serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+            let thought_signature = tc
+                .thought_signature
+                .clone()
+                .or(tc.function.thought_signature.clone());
             content.push(ResponseContentBlock::ToolUse {
                 id: tc.id,
                 name: tc.function.name,
                 input,
+                thought_signature,
             });
         }
     }
@@ -1347,6 +1914,7 @@ mod tests {
                     id: "t1".into(),
                     name: "bash".into(),
                     input: json!({"command": "ls"}),
+                    thought_signature: None,
                 },
             ]),
         }];
@@ -1371,6 +1939,7 @@ mod tests {
                     id: "t1".into(),
                     name: "glob".into(),
                     input: json!({}),
+                    thought_signature: None,
                 }]),
             },
             Message {
@@ -1402,6 +1971,7 @@ mod tests {
                     id: "t1".into(),
                     name: "glob".into(),
                     input: json!({}),
+                    thought_signature: None,
                 }]),
             },
             Message {
@@ -1576,7 +2146,9 @@ mod tests {
                         function: OaiFunction {
                             name: "bash".into(),
                             arguments: r#"{"command":"ls"}"#.into(),
+                            thought_signature: None,
                         },
+                        thought_signature: None,
                     }]),
                 },
                 finish_reason: Some("tool_calls".into()),
@@ -1586,7 +2158,9 @@ mod tests {
         let resp = translate_oai_response(oai);
         assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
         match &resp.content[0] {
-            ResponseContentBlock::ToolUse { id, name, input } => {
+            ResponseContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "bash");
                 assert_eq!(input["command"], "ls");
@@ -1636,7 +2210,9 @@ mod tests {
                         function: OaiFunction {
                             name: "read_file".into(),
                             arguments: r#"{"path":"/tmp/x"}"#.into(),
+                            thought_signature: None,
                         },
+                        thought_signature: None,
                     }]),
                 },
                 finish_reason: Some("tool_calls".into()),
@@ -1680,6 +2256,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "bash".into(),
                 input_json: r#"{"command":"ls","cwd":"/tmp"}"#.into(),
+                thought_signature: None,
             },
         );
         let resp = build_stream_response(
@@ -1691,7 +2268,9 @@ mod tests {
         );
         assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
         match &resp.content[0] {
-            ResponseContentBlock::ToolUse { id, name, input } => {
+            ResponseContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "bash");
                 assert_eq!(input["command"], "ls");
@@ -1752,6 +2331,8 @@ mod tests {
             cursor_agent_timeout_secs: 600,
             social: None,
             vault: None,
+            orchestrator_enabled: true,
+            orchestrator_model: String::new(),
         };
         // Should not panic
         let _provider = create_provider(&config);
@@ -1804,6 +2385,8 @@ mod tests {
             cursor_agent_timeout_secs: 600,
             social: None,
             vault: None,
+            orchestrator_enabled: true,
+            orchestrator_model: String::new(),
         };
         let _provider = create_provider(&config);
     }
@@ -1841,6 +2424,7 @@ mod tests {
                     id: "t1".into(),
                     name: "bash".into(),
                     input: json!({}),
+                    thought_signature: None,
                 }]),
             },
             Message {
@@ -1921,5 +2505,257 @@ mod tests {
         assert!(events.is_empty());
         let tail = parser.finish();
         assert_eq!(tail, vec!["hello".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // translate_messages_to_gemini
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_translate_messages_to_gemini_text() {
+        let msgs = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("hello".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text("hi".into()),
+            },
+        ];
+        let out = translate_messages_to_gemini(&msgs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[0]["parts"][0]["text"], "hello");
+        assert_eq!(out[1]["role"], "model");
+        assert_eq!(out[1]["parts"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn test_translate_messages_to_gemini_tool_use_and_result() {
+        let msgs = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "ls"}),
+                    thought_signature: Some("sig_abc".into()),
+                }]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "file1.txt\nfile2.txt".into(),
+                    is_error: None,
+                }]),
+            },
+        ];
+        let out = translate_messages_to_gemini(&msgs);
+        // Should have: user placeholder, assistant with tool_use, user with tool_result
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "user"); // placeholder
+        assert_eq!(out[1]["role"], "model");
+        let fc = &out[1]["parts"][0]["functionCall"];
+        assert_eq!(fc["name"], "bash");
+        assert_eq!(out[1]["parts"][0]["thoughtSignature"], "sig_abc");
+
+        assert_eq!(out[2]["role"], "user");
+        let fr = &out[2]["parts"][0]["functionResponse"];
+        assert_eq!(fr["name"], "bash");
+        assert_eq!(fr["response"]["result"], "file1.txt\nfile2.txt");
+    }
+
+    #[test]
+    fn test_translate_messages_to_gemini_preserves_thought_signature() {
+        let msgs = vec![Message {
+            role: "assistant".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "search".into(),
+                input: json!({"q": "test"}),
+                thought_signature: Some("preserved_sig".into()),
+            }]),
+        }];
+        let out = translate_messages_to_gemini(&msgs);
+        assert_eq!(out[1]["parts"][0]["thoughtSignature"], "preserved_sig");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_gemini_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_gemini_response_text() {
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{ "text": "Hello, world!" }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5
+            }
+        });
+        let result = parse_gemini_response(&response.to_string()).unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(result.content.len(), 1);
+        match &result.content[0] {
+            ResponseContentBlock::Text { text } => assert_eq!(text, "Hello, world!"),
+            _ => panic!("Expected Text"),
+        }
+        assert_eq!(result.usage.unwrap().input_tokens, 10);
+    }
+
+    #[test]
+    fn test_parse_gemini_response_function_call() {
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "name": "search_web",
+                            "args": { "query": "rust programming" }
+                        },
+                        "thoughtSignature": "sig_xyz"
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 20,
+                "candidatesTokenCount": 10
+            }
+        });
+        let result = parse_gemini_response(&response.to_string()).unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(result.content.len(), 1);
+        match &result.content[0] {
+            ResponseContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            } => {
+                assert_eq!(name, "search_web");
+                assert_eq!(input["query"], "rust programming");
+                assert_eq!(thought_signature.as_deref(), Some("sig_xyz"));
+                assert!(!id.is_empty()); // UUID generated
+            }
+            _ => panic!("Expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn test_parse_gemini_response_text_and_function_call() {
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        { "text": "Let me search for that." },
+                        {
+                            "functionCall": {
+                                "name": "search",
+                                "args": { "q": "test" }
+                            },
+                            "thoughtSignature": "sig_abc"
+                        }
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let result = parse_gemini_response(&response.to_string()).unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(result.content.len(), 2);
+        match &result.content[0] {
+            ResponseContentBlock::Text { text } => {
+                assert_eq!(text, "Let me search for that.")
+            }
+            _ => panic!("Expected Text"),
+        }
+        match &result.content[1] {
+            ResponseContentBlock::ToolUse { name, .. } => assert_eq!(name, "search"),
+            _ => panic!("Expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn test_parse_gemini_response_empty() {
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": []
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let result = parse_gemini_response(&response.to_string()).unwrap();
+        assert_eq!(result.content.len(), 1);
+        match &result.content[0] {
+            ResponseContentBlock::Text { text } => assert_eq!(text, ""),
+            _ => panic!("Expected Text"),
+        }
+    }
+
+    #[test]
+    fn test_create_provider_google() {
+        let config = Config {
+            telegram_bot_token: "tok".into(),
+            bot_username: "bot".into(),
+            llm_provider: "google".into(),
+            api_key: "key".into(),
+            model: "gemini-2.5-flash".into(),
+            llm_base_url: None,
+            max_tokens: 8192,
+            max_tool_iterations: 100,
+            max_history_messages: 50,
+            max_document_size_mb: 100,
+            workspace_dir: "/tmp".into(),
+            openai_api_key: None,
+            timezone: "UTC".into(),
+            allowed_groups: vec![],
+            control_chat_ids: vec![],
+            max_session_messages: 40,
+            compact_keep_recent: 20,
+            whatsapp_access_token: None,
+            whatsapp_phone_number_id: None,
+            whatsapp_verify_token: None,
+            whatsapp_webhook_port: 8080,
+            discord_bot_token: None,
+            discord_allowed_channels: vec![],
+            show_thinking: false,
+            web_enabled: false,
+            web_host: "127.0.0.1".into(),
+            web_port: 3900,
+            web_auth_token: None,
+            web_max_inflight_per_session: 2,
+            web_max_requests_per_window: 8,
+            web_rate_window_seconds: 10,
+            web_run_history_limit: 512,
+            web_session_idle_ttl_seconds: 300,
+            browser_managed: false,
+            browser_executable_path: None,
+            browser_cdp_port_base: 9222,
+            browser_idle_timeout_secs: None,
+            browser_headless: false,
+            agent_browser_path: None,
+            cursor_agent_cli_path: "cursor-agent".into(),
+            cursor_agent_model: String::new(),
+            cursor_agent_timeout_secs: 600,
+            social: None,
+            vault: None,
+            orchestrator_enabled: true,
+            orchestrator_model: String::new(),
+        };
+        // Should not panic
+        let _provider = create_provider(&config);
     }
 }
