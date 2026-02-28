@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Badge, Button, Flex, ScrollArea, Separator, Text } from '@radix-ui/themes'
-import type { SessionItem } from '../types'
+import type { Persona } from '../types'
 
 type SessionSidebarProps = {
   appearance: 'dark' | 'light'
@@ -8,14 +8,13 @@ type SessionSidebarProps = {
   uiTheme: string
   onUiThemeChange: (theme: string) => void
   uiThemeOptions: Array<{ key: string; label: string; color: string }>
-  sessionItems: SessionItem[]
-  selectedSessionKey: string
-  onSessionSelect: (key: string) => void
-  onRefreshSession: (key: string) => void
-  onResetSession: (key: string) => void
-  onDeleteSession: (key: string) => void
+  personas: Persona[]
+  selectedPersonaId: number | null
+  onPersonaSelect: (personaName: string) => void
+  onRefreshChat: () => void
+  onResetChat: () => void
+  onDeleteChat: () => void
   onOpenConfig: () => Promise<void>
-  onNewSession: () => void
 }
 
 export function SessionSidebar({
@@ -24,21 +23,20 @@ export function SessionSidebar({
   uiTheme,
   onUiThemeChange,
   uiThemeOptions,
-  sessionItems,
-  selectedSessionKey,
-  onSessionSelect,
-  onRefreshSession,
-  onResetSession,
-  onDeleteSession,
+  personas,
+  selectedPersonaId,
+  onPersonaSelect,
+  onRefreshChat,
+  onResetChat,
+  onDeleteChat,
   onOpenConfig,
-  onNewSession,
 }: SessionSidebarProps) {
   const isDark = appearance === 'dark'
-  const [menu, setMenu] = useState<{ x: number; y: number; key: string } | null>(null)
+  const [chatMenuOpen, setChatMenuOpen] = useState(false)
   const [themeMenuOpen, setThemeMenuOpen] = useState(false)
   const themeMenuRef = useRef<HTMLDivElement | null>(null)
   const themeButtonRef = useRef<HTMLButtonElement | null>(null)
-  const sessionMenuRef = useRef<HTMLDivElement | null>(null)
+  const chatMenuRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
@@ -47,14 +45,14 @@ export function SessionSidebar({
 
       if (themeButtonRef.current?.contains(target)) return
       if (themeMenuRef.current?.contains(target)) return
-      if (sessionMenuRef.current?.contains(target)) return
+      if (chatMenuRef.current?.contains(target)) return
 
-      setMenu(null)
+      setChatMenuOpen(false)
       setThemeMenuOpen(false)
     }
 
     const closeOnScroll = () => {
-      setMenu(null)
+      setChatMenuOpen(false)
       setThemeMenuOpen(false)
     }
 
@@ -161,25 +159,57 @@ export function SessionSidebar({
         </div>
       </Flex>
 
-      <Flex direction="column" gap="2" className="mb-4">
-        <button
-          type="button"
-          onClick={onNewSession}
-          className="inline-flex h-9 w-full items-center justify-center rounded-md border border-transparent text-[15px] font-medium transition hover:brightness-110 active:brightness-95"
-          style={isDark ? { backgroundColor: 'var(--mc-accent)', color: '#06110f' } : { backgroundColor: 'var(--mc-accent)', color: '#ffffff' }}
-        >
-          New Session
-        </button>
-      </Flex>
-
-      <Separator size="4" className="my-4" />
-
       <Flex justify="between" align="center" className="mb-2">
         <Text size="2" weight="medium" color="gray">
-          Sessions
+          Persona
         </Text>
-        <Badge variant="surface">{sessionItems.length}</Badge>
+        <div className="relative" ref={chatMenuRef}>
+          <button
+            type="button"
+            onClick={() => setChatMenuOpen((o) => !o)}
+            className={
+              isDark
+                ? 'rounded-md border border-[color:var(--mc-border-soft)] px-2 py-1 text-xs text-slate-400 hover:bg-[color:var(--mc-bg-panel)]'
+                : 'rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:bg-slate-100'
+            }
+          >
+            ⋮
+          </button>
+          {chatMenuOpen ? (
+            <div
+              className={
+                isDark
+                  ? 'absolute right-0 top-8 z-50 min-w-[140px] rounded-lg border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-sidebar)] p-1 shadow-xl'
+                  : 'absolute right-0 top-8 z-50 min-w-[140px] rounded-lg border border-slate-200 bg-white p-1 shadow-xl'
+              }
+            >
+              <button
+                type="button"
+                className="w-full rounded-md px-3 py-2 text-left text-sm hover:bg-black/5"
+                onClick={() => { onRefreshChat(); setChatMenuOpen(false) }}
+              >
+                Refresh
+              </button>
+              <button
+                type="button"
+                className="w-full rounded-md px-3 py-2 text-left text-sm text-amber-700 hover:bg-amber-50"
+                onClick={() => { onResetChat(); setChatMenuOpen(false) }}
+              >
+                Clear context
+              </button>
+              <button
+                type="button"
+                className="w-full rounded-md px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50"
+                onClick={() => { onDeleteChat(); setChatMenuOpen(false) }}
+              >
+                Delete chat
+              </button>
+            </div>
+          ) : null}
+        </div>
       </Flex>
+
+      <Separator size="4" className="my-2" />
 
       <div
         className={
@@ -189,45 +219,35 @@ export function SessionSidebar({
         }
       >
         <ScrollArea type="auto" style={{ height: '100%' }}>
-          <div className="mb-2">
-            <Text size="1" color="gray">
-              Chats
-            </Text>
-          </div>
-          <div className="flex flex-col gap-1.5 pr-1">
-            {sessionItems.map((item) => (
-              <button
-                key={item.session_key}
-                type="button"
-                onClick={() => onSessionSelect(item.session_key)}
-                onContextMenu={(e) => {
-                  e.preventDefault()
-                  setMenu({ x: e.clientX, y: e.clientY, key: item.session_key })
-                }}
-                className={
-                  selectedSessionKey === item.session_key
-                    ? isDark
-                      ? 'flex w-full flex-col items-start rounded-lg border border-[color:var(--mc-accent)] bg-[color:var(--mc-bg-panel)] px-3 py-2 text-left shadow-sm'
-                      : 'flex w-full flex-col items-start rounded-lg border bg-white px-3 py-2 text-left shadow-sm'
-                    : isDark
-                      ? 'flex w-full flex-col items-start rounded-lg border border-transparent px-3 py-2 text-left text-slate-300 hover:border-[color:var(--mc-border-soft)] hover:bg-[color:var(--mc-bg-panel)]'
-                      : 'flex w-full flex-col items-start rounded-lg border border-transparent px-3 py-2 text-left text-slate-600 hover:border-slate-200 hover:bg-white'
-                }
-                style={
-                  !isDark && selectedSessionKey === item.session_key
-                    ? {
-                        borderColor: 'color-mix(in srgb, var(--mc-accent) 36%, #94a3b8)',
-                        boxShadow: '0 4px 12px color-mix(in srgb, var(--mc-accent) 12%, transparent)',
-                      }
-                    : undefined
-                }
-              >
-                <span className="max-w-[220px] truncate text-sm font-medium">{item.label}</span>
-                <span className={isDark ? 'mt-0.5 text-[11px] uppercase tracking-wide text-slate-500' : 'mt-0.5 text-[11px] uppercase tracking-wide text-slate-400'}>
-                  {item.chat_type !== 'web' ? 'Read-only' : item.chat_type}
-                </span>
-              </button>
-            ))}
+          <div className="flex flex-col gap-1 pr-1">
+            {personas.length === 0 ? (
+              <Text size="1" color="gray">Loading…</Text>
+            ) : (
+              personas.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => onPersonaSelect(p.name)}
+                  className={
+                    selectedPersonaId === p.id
+                      ? isDark
+                        ? 'flex w-full items-center justify-between rounded-lg border border-[color:var(--mc-accent)] bg-[color:var(--mc-bg-panel)] px-3 py-2 text-left text-sm shadow-sm'
+                        : 'flex w-full items-center justify-between rounded-lg border bg-white px-3 py-2 text-left text-sm shadow-sm'
+                      : isDark
+                        ? 'flex w-full items-center justify-between rounded-lg border border-transparent px-3 py-2 text-left text-sm text-slate-300 hover:border-[color:var(--mc-border-soft)] hover:bg-[color:var(--mc-bg-panel)]'
+                        : 'flex w-full items-center justify-between rounded-lg border border-transparent px-3 py-2 text-left text-sm text-slate-600 hover:border-slate-200 hover:bg-white'
+                  }
+                  style={
+                    !isDark && selectedPersonaId === p.id
+                      ? { borderColor: 'color-mix(in srgb, var(--mc-accent) 36%, #94a3b8)' }
+                      : undefined
+                  }
+                >
+                  <span className="font-medium">{p.name}</span>
+                  {p.is_active ? <Badge size="1" variant="soft">active</Badge> : null}
+                </button>
+              ))
+            )}
           </div>
         </ScrollArea>
       </div>
@@ -248,61 +268,6 @@ export function SessionSidebar({
         </div>
       </div>
 
-      {menu ? (
-        <div
-          ref={sessionMenuRef}
-          className={
-            isDark
-              ? 'fixed z-50 min-w-[170px] rounded-lg border border-emerald-900/80 bg-[#092018] p-1.5 shadow-xl'
-              : 'fixed z-50 min-w-[170px] rounded-lg border border-slate-300 bg-white p-1.5 shadow-xl'
-          }
-          style={{ left: menu.x, top: menu.y }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <button
-            type="button"
-            className={
-              isDark
-                ? 'flex w-full rounded-md px-3 py-2 text-left text-sm text-slate-100 hover:bg-emerald-900/50'
-                : 'flex w-full rounded-md px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100'
-            }
-            onClick={() => {
-              onRefreshSession(menu.key)
-              setMenu(null)
-            }}
-          >
-            Refresh
-          </button>
-          <button
-            type="button"
-            className={
-              isDark
-                ? 'mt-1 flex w-full rounded-md px-3 py-2 text-left text-sm text-amber-300 hover:bg-amber-900/20'
-                : 'mt-1 flex w-full rounded-md px-3 py-2 text-left text-sm text-amber-700 hover:bg-amber-50'
-            }
-            onClick={() => {
-              onResetSession(menu.key)
-              setMenu(null)
-            }}
-          >
-            Clear Context
-          </button>
-          <button
-            type="button"
-            className={
-              isDark
-                ? 'mt-1 flex w-full rounded-md px-3 py-2 text-left text-sm text-red-300 hover:bg-red-900/20'
-                : 'mt-1 flex w-full rounded-md px-3 py-2 text-left text-sm text-red-700 hover:bg-red-50'
-            }
-            onClick={() => {
-              onDeleteSession(menu.key)
-              setMenu(null)
-            }}
-          >
-            Delete
-          </button>
-        </div>
-      ) : null}
     </aside>
   )
 }

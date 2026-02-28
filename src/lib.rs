@@ -19,6 +19,7 @@ pub mod scheduler;
 pub mod setup;
 pub mod skills;
 pub mod social_oauth;
+pub mod tool_skill_agent;
 pub mod tools;
 pub mod transcribe;
 pub mod web;

@@ -7,6 +7,7 @@ use super::{auth_context_from_input, schema_object, Tool, ToolRegistry, ToolResu
 use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock, ToolDefinition};
 use crate::config::Config;
 use crate::db::Database;
+use crate::tool_skill_agent::{evaluate_tool_use, TsaDecision};
 
 const MAX_SUB_AGENT_ITERATIONS: usize = 10;
 
@@ -146,7 +147,35 @@ impl Tool for SubAgentTool {
                             name,
                             iteration + 1
                         );
-                        let result = if let Some(ref auth) = auth_context {
+                        let tsa_deny = if self.config.tool_skill_agent_enabled && auth_context.is_some() {
+                            match evaluate_tool_use(
+                                &self.config,
+                                name,
+                                input,
+                                &messages,
+                                auth_context.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok(tsa_result) if tsa_result.decision == TsaDecision::Deny => {
+                                    let mut msg = format!("[Tool use denied] {}", tsa_result.reason);
+                                    if let Some(ref sug) = tsa_result.suggestion {
+                                        msg.push_str(&format!(" {}", sug));
+                                    }
+                                    Some(ToolResult::error(msg))
+                                }
+                                Ok(_) => None,
+                                Err(e) => {
+                                    info!("Sub-agent TSA evaluation failed, allowing tool: {}", e);
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let result = if let Some(deny) = tsa_deny {
+                            deny
+                        } else if let Some(ref auth) = auth_context {
                             tools.execute_with_auth(name, input.clone(), auth).await
                         } else {
                             tools.execute(name, input.clone()).await
@@ -242,6 +271,10 @@ mod tests {
             vault: None,
             orchestrator_enabled: true,
             orchestrator_model: String::new(),
+            tool_skill_agent_enabled: true,
+            tool_skill_agent_model: String::new(),
+            cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
+            cursor_agent_tmux_enabled: true,
         }
     }
 

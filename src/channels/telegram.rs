@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use serenity::http::Http as SerenityHttp;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommand, ChatAction, ParseMode, ThreadId};
 use tokio::sync::mpsc::UnboundedSender;
@@ -13,7 +14,7 @@ use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::llm::LlmProvider;
 use crate::memory::MemoryManager;
 use crate::skills::SkillManager;
-use crate::orchestrator::{run_orchestrator_plan, PlanStrategy};
+use crate::tool_skill_agent::{evaluate_tool_use, TsaDecision};
 use crate::tools::{ToolAuthContext, ToolRegistry};
 
 /// Escape XML special characters in user-supplied content to prevent prompt injection.
@@ -42,6 +43,8 @@ pub struct AppState {
     pub skills: SkillManager,
     pub llm: Box<dyn LlmProvider>,
     pub tools: ToolRegistry,
+    /// When Discord is enabled, used by deliver_to_contact to send to bound Discord channels.
+    pub discord_http: Option<Arc<SerenityHttp>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -130,6 +133,10 @@ pub async fn run_bot(
         tools.add_tool(Box::new(crate::tools::mcp::McpTool::new(server, tool_info)));
     }
 
+    let discord_http = config.discord_bot_token.as_ref().map(|token| {
+        Arc::new(SerenityHttp::new(token.as_str()))
+    });
+
     let state = Arc::new(AppState {
         config,
         bot: bot.clone(),
@@ -138,6 +145,7 @@ pub async fn run_bot(
         skills,
         llm,
         tools,
+        discord_http,
     });
 
     // Start scheduler
@@ -202,6 +210,13 @@ async fn handle_message(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let chat_id = msg.chat.id.0;
 
+    // Resolve to unified contact (canonical_chat_id); for Telegram, handle == canonical.
+    let canonical_chat_id = call_blocking(state.db.clone(), move |db| {
+        db.resolve_canonical_chat_id("telegram", &chat_id.to_string(), None)
+    })
+    .await
+    .map_err(|e| format!("resolve_canonical_chat_id: {e}"))?;
+
     // Extract content: text, photo, or voice
     let mut text = msg.text().unwrap_or("").to_string();
     // Use caption when there's no body text so slash commands in photo/document captions are handled
@@ -220,12 +235,11 @@ async fn handle_message(
         info!("slash_parse len={} codepoints={:?} result={:?}", text.len(), codepoints, cmd);
     }
     if let Some(cmd) = cmd {
-        let chat_id = msg.chat.id.0;
         match cmd {
             SlashCommand::Reset => {
-                let pid = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(chat_id)).await.unwrap_or(0);
+                let pid = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(canonical_chat_id)).await.unwrap_or(0);
                 if pid > 0 {
-                    let _ = call_blocking(state.db.clone(), move |db| db.delete_session(chat_id, pid)).await;
+                    let _ = call_blocking(state.db.clone(), move |db| db.delete_session(canonical_chat_id, pid)).await;
                 }
                 let mut req = bot.send_message(
                     msg.chat.id,
@@ -241,7 +255,7 @@ async fn handle_message(
                 send_response(&bot, msg.chat.id, &formatted, msg.thread_id).await;
             }
             SlashCommand::Persona => {
-                let resp = crate::persona::handle_persona_command(state.db.clone(), chat_id, text.trim(), Some(&state.config)).await;
+                let resp = crate::persona::handle_persona_command(state.db.clone(), canonical_chat_id, text.trim(), Some(&state.config)).await;
                 send_response(&bot, msg.chat.id, &resp, msg.thread_id).await;
             }
             SlashCommand::Schedule => {
@@ -256,7 +270,7 @@ async fn handle_message(
                 }
             }
             SlashCommand::Archive => {
-                let pid = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(chat_id)).await.unwrap_or(0);
+                let pid = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(canonical_chat_id)).await.unwrap_or(0);
                 let send_archive_msg = |text: &str| {
                     let mut req = bot.send_message(msg.chat.id, text);
                     if let Some(tid) = msg.thread_id {
@@ -269,13 +283,13 @@ async fn handle_message(
                 } else {
                     let pid_f = pid;
                     if let Ok(Some((json, _))) =
-                        call_blocking(state.db.clone(), move |db| db.load_session(chat_id, pid_f)).await
+                        call_blocking(state.db.clone(), move |db| db.load_session(canonical_chat_id, pid_f)).await
                     {
                         let messages: Vec<Message> = serde_json::from_str(&json).unwrap_or_default();
                         if messages.is_empty() {
                             let _ = send_archive_msg("No session to archive.").await;
                         } else {
-                            archive_conversation(&state.config.runtime_data_dir(), chat_id, &messages);
+                            archive_conversation(&state.config.runtime_data_dir(), canonical_chat_id, &messages);
                             let _ = send_archive_msg(&format!("Archived {} messages.", messages.len())).await;
                         }
                     } else {
@@ -465,13 +479,13 @@ async fn handle_message(
 
     let chat_title = msg.chat.title().map(|t| t.to_string());
 
-    // Resolve persona for this chat
-    let persona_id = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(chat_id)).await.unwrap_or(0);
+    // Resolve persona for this contact
+    let persona_id = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(canonical_chat_id)).await.unwrap_or(0);
     if persona_id == 0 {
         return Ok(());
     }
 
-    // Check group allowlist
+    // Check group allowlist (by Telegram chat id)
     if (db_chat_type == "telegram_group" || db_chat_type == "telegram_supergroup")
         && !state.config.allowed_groups.is_empty()
         && !state.config.allowed_groups.contains(&chat_id)
@@ -480,7 +494,7 @@ async fn handle_message(
         let chat_title_owned = chat_title.clone();
         let chat_type_owned = db_chat_type.to_string();
         let _ = call_blocking(state.db.clone(), move |db| {
-            db.upsert_chat(chat_id, chat_title_owned.as_deref(), &chat_type_owned)
+            db.upsert_chat(canonical_chat_id, chat_title_owned.as_deref(), &chat_type_owned)
         })
         .await;
         let stored_content = if image_data.is_some() {
@@ -503,7 +517,7 @@ async fn handle_message(
         };
         let stored = StoredMessage {
             id: msg.id.0.to_string(),
-            chat_id,
+            chat_id: canonical_chat_id,
             persona_id,
             sender_name,
             content: stored_content,
@@ -518,7 +532,7 @@ async fn handle_message(
     let chat_title_owned = chat_title.clone();
     let chat_type_owned = db_chat_type.to_string();
     let _ = call_blocking(state.db.clone(), move |db| {
-        db.upsert_chat(chat_id, chat_title_owned.as_deref(), &chat_type_owned)
+        db.upsert_chat(canonical_chat_id, chat_title_owned.as_deref(), &chat_type_owned)
     })
     .await;
 
@@ -542,7 +556,7 @@ async fn handle_message(
     };
     let stored = StoredMessage {
         id: msg.id.0.to_string(),
-        chat_id,
+        chat_id: canonical_chat_id,
         persona_id,
         sender_name: sender_name.clone(),
         content: stored_content,
@@ -577,6 +591,7 @@ async fn handle_message(
     let chat_id_spawn = msg.chat.id;
     let thread_id_spawn = msg.thread_id;
     let runtime_chat_type_owned = runtime_chat_type.to_string();
+    let canonical_chat_id_spawn = canonical_chat_id;
     tokio::spawn(async move {
         // Typing indicator for the duration of the run
         let typing_bot = bot_spawn.clone();
@@ -640,7 +655,7 @@ async fn handle_message(
             &state_spawn,
             AgentRequestContext {
                 caller_channel: "telegram",
-                chat_id: chat_id_spawn.0,
+                chat_id: canonical_chat_id_spawn,
                 chat_type: &runtime_chat_type_owned,
                 persona_id,
             },
@@ -682,26 +697,24 @@ async fn handle_message(
                     response
                 };
                 info!(
-                    "Sending response to chat {}: {} chars",
-                    chat_id_spawn,
+                    "Delivering response to contact {}: {} chars",
+                    canonical_chat_id_spawn,
                     to_send.len()
                 );
-                send_response(&bot_spawn, chat_id_spawn, &to_send, thread_id_spawn).await;
-
-                let bot_msg = StoredMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    chat_id: chat_id_spawn.0,
-                    persona_id,
-                    sender_name: state_spawn.config.bot_username.clone(),
-                    content: to_send.clone(),
-                    is_from_bot: true,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                };
-                let _ = call_blocking(
+                if let Err(e) = crate::channel::deliver_to_contact(
                     state_spawn.db.clone(),
-                    move |db| db.store_message(&bot_msg),
+                    Some(&state_spawn.bot),
+                    state_spawn.discord_http.as_deref(),
+                    &state_spawn.config.bot_username,
+                    canonical_chat_id_spawn,
+                    persona_id,
+                    &to_send,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(target: "channel", error = %e, "deliver_to_contact failed; sending to Telegram only");
+                    send_response(&bot_spawn, chat_id_spawn, &to_send, thread_id_spawn).await;
+                }
             }
             Err(e) => {
                 error!("Error processing message: {}", e);
@@ -963,143 +976,8 @@ pub async fn process_with_agent_with_events(
         control_chat_ids: state.config.control_chat_ids.clone(),
     };
 
-    // Orchestrator: plan-first step (optional). Use timeout so a slow/hung call doesn't block the reply.
-    const ORCHESTRATOR_TIMEOUT_SECS: u64 = 30;
-    if state.config.orchestrator_enabled {
-        let last_user_msg = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .and_then(|m| match &m.content {
-                MessageContent::Text(t) => Some(t.as_str()),
-                MessageContent::Blocks(blocks) => blocks
-                    .iter()
-                    .find_map(|b| {
-                        if let ContentBlock::Text { text } = b {
-                            Some(text.as_str())
-                        } else {
-                            None
-                        }
-                    }),
-            })
-            .unwrap_or("");
-        let recent_context: Option<String> = if messages.len() > 1 {
-            let recent: Vec<String> = messages
-                .iter()
-                .rev()
-                .take(4)
-                .filter_map(|m| {
-                    let role = &m.role;
-                    let preview = match &m.content {
-                        MessageContent::Text(t) => t.chars().take(100).collect::<String>(),
-                        MessageContent::Blocks(_) => "[blocks]".into(),
-                    };
-                    Some(format!("{role}: {preview}"))
-                })
-                .collect();
-            Some(recent.into_iter().rev().collect::<Vec<_>>().join("\n"))
-        } else {
-            None
-        };
-        let plan_result = tokio::time::timeout(
-            std::time::Duration::from_secs(ORCHESTRATOR_TIMEOUT_SECS),
-            run_orchestrator_plan(
-                &state.config,
-                last_user_msg,
-                recent_context.as_deref(),
-            ),
-        )
-        .await;
-        match plan_result {
-            Ok(Ok(plan)) if plan.strategy == PlanStrategy::Delegate => {
-                if let Some(ref tasks) = plan.delegate_tasks {
-                    if !tasks.is_empty() {
-                        let state_ref = state;
-                        let tool_auth_ref = &tool_auth;
-                        let last_user_msg_owned = last_user_msg.to_string();
-                        let tasks_owned = tasks.clone();
-                        // Run delegate phase with timeout so we don't block the reply forever.
-                        const DELEGATE_PHASE_TIMEOUT_SECS: u64 = 120;
-                        let delegate_result = tokio::time::timeout(
-                            std::time::Duration::from_secs(DELEGATE_PHASE_TIMEOUT_SECS),
-                            async move {
-                                let mut sub_results = Vec::new();
-                                for (i, task) in tasks_owned.iter().enumerate() {
-                                    info!(
-                                        "Orchestrator delegate task {}/{}: {}",
-                                        i + 1,
-                                        tasks_owned.len(),
-                                        task
-                                    );
-                                    let input = serde_json::json!({
-                                        "task": task,
-                                        "context": format!("User message: {}", last_user_msg_owned)
-                                    });
-                                    let result = state_ref
-                                        .tools
-                                        .execute_with_auth("sub_agent", input, tool_auth_ref)
-                                        .await;
-                                    sub_results.push(format!(
-                                        "--- Task {}: {} ---\n{}",
-                                        i + 1,
-                                        task,
-                                        if result.is_error {
-                                            format!("[error] {}", result.content)
-                                        } else {
-                                            result.content
-                                        }
-                                    ));
-                                }
-                                sub_results
-                            },
-                        )
-                        .await;
-                        match delegate_result {
-                            Ok(sub_results) => {
-                                let compiled = sub_results.join("\n\n");
-                                messages.push(Message {
-                                    role: "user".into(),
-                                    content: MessageContent::Text(format!(
-                                        "[orchestrator] Sub-agent results:\n\n{}\n\nOriginal user message: {}",
-                                        compiled,
-                                        last_user_msg
-                                    )),
-                                });
-                            }
-                            Err(_) => {
-                                info!(
-                                    "Orchestrator delegate phase timed out after {}s; answering without sub-agent results",
-                                    DELEGATE_PHASE_TIMEOUT_SECS
-                                );
-                                messages.push(Message {
-                                    role: "user".into(),
-                                    content: MessageContent::Text(format!(
-                                        "[orchestrator] Sub-tasks timed out. Please answer the user directly based on: {}",
-                                        last_user_msg
-                                    )),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(Ok(_)) => {
-                // Direct strategy or empty delegate_tasks: run main agent as normal
-            }
-            Ok(Err(e)) => {
-                info!("Orchestrator failed, falling back to direct: {}", e);
-                // Fall back to main agent
-            }
-            Err(_) => {
-                info!(
-                    "Orchestrator timed out after {}s, falling back to direct",
-                    ORCHESTRATOR_TIMEOUT_SECS
-                );
-                // Fall back to main agent
-            }
-        }
-    }
-
+    // Main agent loop: the chat agent is the single orchestrator. It can call sub_agent when it
+    // wants to delegate; no separate plan-first layer.
     // Agentic tool-use loop. Timeouts prevent hangs:
     // - LLM round timeout: prevents hanging if LLM doesn't respond
     // - Tool execution timeout: prevents hanging on slow/unresponsive tools (e.g., browser, bash)
@@ -1228,14 +1106,45 @@ pub async fn process_with_agent_with_events(
                     info!("Executing tool: {} (iteration {})", name, iteration + 1);
                     let started = std::time::Instant::now();
 
-                    // Execute tool with timeout
-                    let result = match tokio::time::timeout(
-                        std::time::Duration::from_secs(TOOL_EXECUTION_TIMEOUT_SECS),
-                        state.tools.execute_with_auth(name, input.clone(), &tool_auth),
-                    )
-                    .await {
-                        Ok(tool_result) => tool_result,
-                        Err(_) => {
+                    // TSA: allow or deny before execution
+                    let tsa_deny = if state.config.tool_skill_agent_enabled {
+                        match evaluate_tool_use(
+                            &state.config,
+                            name,
+                            input,
+                            &messages,
+                            Some(&tool_auth),
+                        )
+                        .await
+                        {
+                            Ok(tsa_result) if tsa_result.decision == TsaDecision::Deny => {
+                                let mut msg = format!("[Tool use denied] {}", tsa_result.reason);
+                                if let Some(ref sug) = tsa_result.suggestion {
+                                    msg.push_str(&format!(" {}", sug));
+                                }
+                                Some(crate::tools::ToolResult::error(msg).with_error_type("tsa_deny"))
+                            }
+                            Ok(_) => None,
+                            Err(e) => {
+                                info!("TSA evaluation failed, allowing tool: {}", e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let result = if let Some(deny_result) = tsa_deny {
+                        deny_result
+                    } else {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(TOOL_EXECUTION_TIMEOUT_SECS),
+                            state.tools.execute_with_auth(name, input.clone(), &tool_auth),
+                        )
+                        .await
+                        {
+                            Ok(tool_result) => tool_result,
+                            Err(_) => {
                             info!(
                                 "Tool {} timed out after {}s (iteration {})",
                                 name, TOOL_EXECUTION_TIMEOUT_SECS, iteration + 1
@@ -1255,7 +1164,7 @@ pub async fn process_with_agent_with_events(
                                 error_type: Some("timeout".into()),
                             }
                         }
-                    };
+                    } };
 
                     if let Some(tx) = event_tx {
                         let preview = if result.content.chars().count() > 160 {
@@ -1426,14 +1335,15 @@ fn build_system_prompt(
 - Export chat history to markdown (export_chat)
 - Understand images sent by users (they appear as image content blocks)
 - Delegate self-contained sub-tasks to a parallel agent (sub_agent)
-- Run the Cursor CLI agent (cursor_agent) for research or code tasks; use list_cursor_agent_runs to monitor project status and see recent run outcomes
-- Activate agent skills (activate_skill) for specialized tasks. **You MUST implement any new tool as a skill:** create a folder under the skills directory ({skills_dir_display}/<name>/) with SKILL.md (description, when to use, how to invoke). **Store credentials and config for that tool inside the skill folder** (e.g. .env or config file there) so all personas can use it. Do not create tools only in your workspace or only document in TOOLS.md — skills are the only way to add on-demand tools.
+- Run the Cursor CLI agent (cursor_agent) for research or code tasks; use detach: true to spawn in tmux and return immediately (then attach with tmux attach -t <session>); use cursor_agent_send to send keys to a running session; use list_cursor_agent_runs to see runs and session names
+- Activate agent skills (activate_skill) for specialized tasks. **To create or update a skill, use the build_skill tool only** — do not use write_file or edit_file under the skills directory. build_skill runs cursor-agent (in tmux when available) to create the skill folder and SKILL.md. Store credentials in the skill folder (e.g. .env there). Do not add on-demand tools only in your workspace or TOOLS.md — skills are the only way to add on-demand tools.
 - Read and update tiered memory (read_tiered_memory, write_tiered_memory) — per-persona MEMORY.md with Tier 1 (long-term principles-like), Tier 2 (active projects), Tier 3 (recent focus/mood); evaluate conversation flow and update tiers when appropriate; Tier 1 only on explicit user ask, Tier 3 often (e.g. daily). Not a todo list.
 
 ## Conversation Memory
 - **Working memory (exact)**: The last few turns of this conversation (at least 2 from you and 2 from the user) are provided verbatim above. When the most recent message is from the user, treat it as often being a direct reply to your last message; use it to continue the conversation coherently.
 - **Long-term conversation recall**: Use `search_chat_history` to search ALL past messages in this chat by keyword/phrase. Always search before saying "I don't remember" or asking the user to repeat something.
-- **Vault knowledge base**: Use the `search_vault` tool (when available) to semantically search the ORIGIN vault. Do NOT use grep, read_file, or other file tools for vault retrieval — search_vault is the correct tool. The vault is a knowledge base, NOT conversation history."#,
+- **Vault knowledge base**: Use the `search_vault` tool (when available) to semantically search the ORIGIN vault. Do NOT use grep, read_file, or other file tools for vault retrieval — search_vault is the correct tool. The vault is a knowledge base, NOT conversation history.
+- **Skills directory**: {skills_dir_display}"#,
         skills_dir_display = skills_dir_display
     );
     let mut prompt = format!(
@@ -1463,7 +1373,7 @@ User messages are wrapped in XML tags like <user_message sender="name">content</
 
 The workspace (your working directory for file/bash/search tools) is persistent across sessions. Your workspace path is: {workspace_path}. Relative paths in read_file, write_file, edit_file, glob, and grep are resolved from this directory.
 
-**Creating a new tool:** You MUST create it as a skill. The skills directory is: {skills_dir_display}. When creating a skill, use this **exact path** in write_file and edit_file (e.g. write_file path "{skills_dir_display}/<tool_name>/SKILL.md", ...) — do not use a relative path or a path under your workspace, or files will end up in the wrong place. (1) Create a folder at {skills_dir_display}/<tool_name>/ with SKILL.md (description, when to use, how to invoke). (2) Put any credentials or config (e.g. API keys, .env) in that skill folder so they are available to all personas. (3) Optionally put the script in the skill folder or reference a script in your workspace (the same directory as TOOLS.md) from the SKILL. Do not add on-demand tools only in your workspace or only in TOOLS.md — every tool must be a skill with credentials in the skill folder.
+**Creating a new tool:** You MUST create it as a skill using the **build_skill** tool only. Do not use write_file or edit_file to create or change files under the skills directory — that is denied. Call build_skill with name, description, and instructions; it runs cursor-agent to create the skill at {skills_dir_display}/<name>/ with SKILL.md and folder. Put credentials (e.g. .env) in the skill folder. Do not add on-demand tools only in your workspace or TOOLS.md — every tool must be a skill, created via build_skill.
 
 Be concise and helpful. When executing commands or tools, show the relevant results to the user.
 "#,

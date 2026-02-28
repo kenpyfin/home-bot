@@ -99,11 +99,27 @@ fn default_cursor_agent_timeout_secs() -> u64 {
 }
 
 fn default_orchestrator_enabled() -> bool {
-    true
+    false
 }
 
 fn default_orchestrator_model() -> String {
     String::new()
+}
+
+fn default_tool_skill_agent_enabled() -> bool {
+    true
+}
+
+fn default_tool_skill_agent_model() -> String {
+    String::new()
+}
+
+fn default_cursor_agent_tmux_session_prefix() -> String {
+    "microclaw-cursor".into()
+}
+
+fn default_cursor_agent_tmux_enabled() -> bool {
+    true
 }
 
 fn is_local_web_host(host: &str) -> bool {
@@ -280,12 +296,24 @@ pub struct Config {
     /// Optional vault/vector DB config for ORIGIN Obsidian vault integration.
     #[serde(default)]
     pub vault: Option<VaultConfig>,
-    /// Enable plan-first orchestrator: run planning step before main agent loop.
+    /// [Unused] Legacy: plan-first orchestrator. Default false; main chat acts as orchestrator via sub_agent tool.
     #[serde(default = "default_orchestrator_enabled")]
     pub orchestrator_enabled: bool,
     /// Optional model override for orchestrator (e.g. faster/cheaper). If empty, use main model.
     #[serde(default = "default_orchestrator_model")]
     pub orchestrator_model: String,
+    /// Enable Tool and Skill Agent: gate all tool/skill use and creation before execution.
+    #[serde(default = "default_tool_skill_agent_enabled")]
+    pub tool_skill_agent_enabled: bool,
+    /// Optional model for TSA (e.g. faster/cheaper). If empty, use orchestrator_model or main model.
+    #[serde(default = "default_tool_skill_agent_model")]
+    pub tool_skill_agent_model: String,
+    /// Tmux session name prefix for cursor_agent when detach=true (e.g. microclaw-cursor).
+    #[serde(default = "default_cursor_agent_tmux_session_prefix")]
+    pub cursor_agent_tmux_session_prefix: String,
+    /// Allow spawning cursor_agent in tmux when detach=true. Set false in Docker or when tmux unavailable.
+    #[serde(default = "default_cursor_agent_tmux_enabled")]
+    pub cursor_agent_tmux_enabled: bool,
 }
 
 impl Config {
@@ -570,6 +598,17 @@ impl Config {
                 default_orchestrator_enabled(),
             ),
             orchestrator_model: Self::env("ORCHESTRATOR_MODEL").unwrap_or_default(),
+            tool_skill_agent_enabled: Self::env_bool(
+                "TOOL_SKILL_AGENT_ENABLED",
+                default_tool_skill_agent_enabled(),
+            ),
+            tool_skill_agent_model: Self::env("TOOL_SKILL_AGENT_MODEL").unwrap_or_default(),
+            cursor_agent_tmux_session_prefix: Self::env("CURSOR_AGENT_TMUX_SESSION_PREFIX")
+                .unwrap_or_else(default_cursor_agent_tmux_session_prefix),
+            cursor_agent_tmux_enabled: Self::env_bool(
+                "CURSOR_AGENT_TMUX_ENABLED",
+                default_cursor_agent_tmux_enabled(),
+            ),
         }
     }
 
@@ -798,6 +837,10 @@ mod tests {
             vault: None,
             orchestrator_enabled: true,
             orchestrator_model: String::new(),
+            tool_skill_agent_enabled: true,
+            tool_skill_agent_model: String::new(),
+            cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
+            cursor_agent_tmux_enabled: true,
         }
     }
 

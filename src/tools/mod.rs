@@ -322,6 +322,8 @@ impl ToolRegistry {
             Box::new(sub_agent::SubAgentTool::new(config, db.clone())),
             Box::new(cursor_agent::CursorAgentTool::new(config, db.clone())),
             Box::new(cursor_agent::ListCursorAgentRunsTool::new(db.clone())),
+            Box::new(cursor_agent::CursorAgentSendTool::new(config)),
+            Box::new(cursor_agent::BuildSkillTool::new(config, db.clone())),
             Box::new(activate_skill::ActivateSkillTool::new_with_dirs([
                 &primary_skills,
                 &shared_skills,

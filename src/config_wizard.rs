@@ -446,6 +446,10 @@ fn default_config() -> Config {
         vault: None,
         orchestrator_enabled: true,
         orchestrator_model: String::new(),
+        tool_skill_agent_enabled: true,
+        tool_skill_agent_model: String::new(),
+        cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
+        cursor_agent_tmux_enabled: true,
     }
 }
 

@@ -37,7 +37,7 @@ import '@radix-ui/themes/styles.css'
 import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
 import { SessionSidebar } from './components/session-sidebar'
-import type { SessionItem } from './types'
+import type { SessionItem, Persona, ScheduleTask, ChannelBinding } from './types'
 
 type ConfigPayload = Record<string, unknown>
 
@@ -186,6 +186,29 @@ function writeSessionToUrl(sessionKey: string): void {
 
 /** Stable default for web-only sessions; backend maps this to a fixed chat_id. */
 const DEFAULT_WEB_SESSION_KEY = 'main'
+
+const PERSONA_STORAGE_KEY = 'microclaw_selected_persona_id'
+
+function readStoredPersonaId(): number | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const raw = localStorage.getItem(PERSONA_STORAGE_KEY)
+    if (raw === null) return null
+    const n = parseInt(raw, 10)
+    return Number.isFinite(n) ? n : null
+  } catch {
+    return null
+  }
+}
+
+function writeStoredPersonaId(id: number): void {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.setItem(PERSONA_STORAGE_KEY, String(id))
+  } catch {
+    // ignore
+  }
+}
 
 function getInitialSessionKey(): string {
   if (typeof window === 'undefined') return DEFAULT_WEB_SESSION_KEY
@@ -407,10 +430,6 @@ function mapBackendHistory(messages: BackendMessage[]): ThreadMessageLike[] {
   }))
 }
 
-function makeSessionKey(): string {
-  return `session-${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}`
-}
-
 function asObject(value: unknown): Record<string, unknown> {
   if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
     return value as Record<string, unknown>
@@ -583,7 +602,7 @@ function App() {
   const [uiTheme, setUiTheme] = useState<UiTheme>(readUiTheme())
   const [sessions, setSessions] = useState<SessionItem[]>([])
   const [extraSessions, setExtraSessions] = useState<SessionItem[]>([])
-  const [sessionKey, setSessionKey] = useState<string>(() => getInitialSessionKey())
+  const [sessionKey, setSessionKey] = useState<string>(() => DEFAULT_WEB_SESSION_KEY)
   const [historySeed, setHistorySeed] = useState<ThreadMessageLike[]>([])
   const [historyCountBySession, setHistoryCountBySession] = useState<Record<string, number>>({})
   const [runtimeNonce, setRuntimeNonce] = useState<number>(0)
@@ -597,6 +616,14 @@ function App() {
   const [saveStatus, setSaveStatus] = useState<string>('')
   const [authRequired, setAuthRequired] = useState<boolean>(false)
   const [authTokenInput, setAuthTokenInput] = useState<string>('')
+  const [personas, setPersonas] = useState<Persona[]>([])
+  const [activePersonaId, setActivePersonaId] = useState<number | null>(null)
+  const [schedules, setSchedules] = useState<ScheduleTask[]>([])
+  const [schedulesOpen, setSchedulesOpen] = useState<boolean>(false)
+  const [newSchedulePrompt, setNewSchedulePrompt] = useState('')
+  const [newScheduleType, setNewScheduleType] = useState<'cron' | 'once'>('cron')
+  const [newScheduleValue, setNewScheduleValue] = useState('0 9 * * *')
+  const [bindings, setBindings] = useState<ChannelBinding[]>([])
 
   React.useEffect(() => {
     const onAuthRequired = () => setAuthRequired(true)
@@ -604,51 +631,64 @@ function App() {
     return () => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired)
   }, [])
 
-  const sessionItems = useMemo(() => {
-    const map = new Map<string, SessionItem>()
+  // Single chat: always use default session key (one chat synced across all channels).
+  const effectiveSessionKey = sessionKey || DEFAULT_WEB_SESSION_KEY
 
-    for (const item of [...extraSessions, ...sessions]) {
-      if (!map.has(item.session_key)) {
-        map.set(item.session_key, item)
+  const selectedSessionLabel = 'Chat'
+  const selectedSessionReadOnly = false
+
+  /** Loads personas and applies stored preference; returns the chosen persona id and name for history/switch. */
+  async function loadPersonas(target = effectiveSessionKey): Promise<{ id: number; name: string } | null> {
+    try {
+      const query = new URLSearchParams({ session_key: target })
+      const data = await api<{ personas?: { id: number; name: string; is_active: boolean }[] }>(`/api/personas?${query.toString()}`)
+      const list = Array.isArray(data.personas) ? data.personas : []
+      const personaList = list.map((p) => ({ id: p.id, name: p.name, is_active: p.is_active }))
+      setPersonas(personaList)
+      const active = list.find((p) => p.is_active)
+      const defaultChoice = active ?? list[0]
+      const storedId = readStoredPersonaId()
+      const storedInList = storedId !== null && list.some((p) => p.id === storedId)
+      const chosen = storedInList && list.find((p) => p.id === storedId)
+        ? { id: list.find((p) => p.id === storedId)!.id, name: list.find((p) => p.id === storedId)!.name }
+        : defaultChoice
+            ? { id: defaultChoice.id, name: defaultChoice.name }
+            : null
+      if (chosen) {
+        setActivePersonaId(chosen.id)
+        if (!storedInList) writeStoredPersonaId(chosen.id)
+      } else {
+        setActivePersonaId(null)
       }
+      return chosen
+    } catch {
+      setPersonas([])
+      setActivePersonaId(null)
+      return null
     }
+  }
 
-    if (!map.has(sessionKey) && !sessionKey.startsWith('chat:')) {
-      map.set(sessionKey, {
-        session_key: sessionKey,
-        label: sessionKey,
-        chat_id: 0,
-        chat_type: 'web',
-      })
-    }
-
-    if (map.size === 0) {
-      map.set(DEFAULT_WEB_SESSION_KEY, {
-        session_key: DEFAULT_WEB_SESSION_KEY,
-        label: DEFAULT_WEB_SESSION_KEY,
-        chat_id: 0,
-        chat_type: 'web',
-      })
-    }
-
-    return Array.from(map.values())
-  }, [extraSessions, sessions, sessionKey])
-
-  const selectedSession = useMemo(
-    () => sessionItems.find((item) => item.session_key === sessionKey),
-    [sessionItems, sessionKey],
-  )
-
-  const selectedSessionLabel = selectedSession?.label || sessionKey
-  const selectedSessionReadOnly = Boolean(selectedSession && selectedSession.chat_type !== 'web')
+  async function switchPersona(personaName: string): Promise<void> {
+    await api('/api/personas/switch', {
+      method: 'POST',
+      body: JSON.stringify({ session_key: effectiveSessionKey, persona_name: personaName }),
+    })
+    const p = personas.find((x) => x.name === personaName)
+    if (p) writeStoredPersonaId(p.id)
+    await loadPersonas(effectiveSessionKey)
+    await loadHistory(effectiveSessionKey, p?.id ?? undefined)
+    setRuntimeNonce((x) => x + 1)
+  }
 
   async function loadSessions(): Promise<void> {
     const data = await api<{ sessions?: SessionItem[] }>('/api/sessions')
     setSessions(Array.isArray(data.sessions) ? data.sessions : [])
   }
 
-  async function loadHistory(target = sessionKey): Promise<void> {
-    const query = new URLSearchParams({ session_key: target, limit: '200' })
+  async function loadHistory(target = effectiveSessionKey, personaId?: number | null): Promise<void> {
+    const query = new URLSearchParams({ session_key: target })
+    if (personaId != null && personaId > 0) query.set('persona_id', String(personaId))
+    query.set('limit', '2000')
     const data = await api<{ messages?: BackendMessage[] }>(`/api/history?${query.toString()}`)
     const rawMessages = Array.isArray(data.messages) ? data.messages : []
     const mapped = mapBackendHistory(rawMessages)
@@ -674,13 +714,15 @@ function App() {
             throw new Error('This chat is read-only. Switch to a web session or create a new chat to send messages.')
           }
 
+          const sendBody: { session_key: string; persona_id?: number; sender_name: string; message: string } = {
+            session_key: effectiveSessionKey,
+            sender_name: 'web-user',
+            message: userText,
+          }
+          if (activePersonaId != null && activePersonaId > 0) sendBody.persona_id = activePersonaId
           const sendResponse = await api<{ run_id?: string }>('/api/send_stream', {
             method: 'POST',
-            body: JSON.stringify({
-              session_key: sessionKey,
-              sender_name: 'web-user',
-              message: userText,
-            }),
+            body: JSON.stringify(sendBody),
             signal: options.abortSignal,
           })
 
@@ -846,7 +888,7 @@ function App() {
                 )
                 if (status.done === true) {
                   setStatusText('Done')
-                  await loadHistory(sessionKey)
+                  await loadHistory(effectiveSessionKey)
                   break
                 }
               } catch {
@@ -858,31 +900,12 @@ function App() {
         } finally {
           setSending(false)
           void loadSessions()
-          void loadHistory(sessionKey)
+          void loadHistory(effectiveSessionKey, activePersonaId ?? undefined)
         }
       },
     }),
-    [sessionKey, selectedSessionReadOnly],
+    [effectiveSessionKey, selectedSessionReadOnly],
   )
-
-  function createSession(): void {
-    const currentCount = historyCountBySession[sessionKey] ?? historySeed.length
-    const key = makeSessionKey()
-    const item: SessionItem = {
-      session_key: key,
-      label: key,
-      chat_id: 0,
-      chat_type: 'web',
-    }
-    setExtraSessions((prev) => (prev.some((v) => v.session_key === key) ? prev : [item, ...prev]))
-    setSessionKey(key)
-    setHistoryCountBySession((prev) => ({ ...prev, [key]: 0 }))
-    setHistorySeed([])
-    setRuntimeNonce((x) => x + 1)
-    setReplayNotice('')
-    setError('')
-    setStatusText(currentCount === 0 ? 'New session created.' : 'Idle')
-  }
 
   function toggleAppearance(): void {
     setAppearance((prev) => (prev === 'dark' ? 'light' : 'dark'))
@@ -894,23 +917,23 @@ function App() {
         method: 'POST',
         body: JSON.stringify({ session_key: targetSession }),
       })
-      if (targetSession === sessionKey) {
+      if (targetSession === effectiveSessionKey) {
         await loadHistory(targetSession)
       }
       await loadSessions()
-      setStatusText('Session reset')
+      setStatusText('Context cleared')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  async function onRefreshSessionByKey(targetSession: string): Promise<void> {
+  async function onRefreshSessionByKey(targetSession: string, personaId?: number | null): Promise<void> {
     try {
-      if (targetSession === sessionKey) {
-        await loadHistory(targetSession)
+      if (targetSession === effectiveSessionKey) {
+        await loadHistory(targetSession, personaId ?? undefined)
       }
       await loadSessions()
-      setStatusText('Session refreshed')
+      setStatusText('Chat refreshed')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -934,12 +957,8 @@ function App() {
         return next
       })
 
-      const fallback =
-        sessionItems.find((item) => item.session_key !== targetSession)?.session_key ||
-        DEFAULT_WEB_SESSION_KEY
-      if (targetSession === sessionKey) {
-        setSessionKey(fallback)
-        await loadHistory(fallback)
+      if (targetSession === effectiveSessionKey) {
+        await loadHistory(DEFAULT_WEB_SESSION_KEY)
       }
       await loadSessions()
       if (resp.deleted !== false) {
@@ -1075,16 +1094,93 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  async function loadSchedules(target = effectiveSessionKey): Promise<void> {
+    try {
+      const query = new URLSearchParams({ session_key: target })
+      const data = await api<{ tasks?: ScheduleTask[] }>(`/api/schedules?${query.toString()}`)
+      setSchedules(Array.isArray(data.tasks) ? data.tasks : [])
+    } catch {
+      setSchedules([])
+    }
+  }
+
+  async function loadBindings(target = effectiveSessionKey): Promise<void> {
+    try {
+      const query = new URLSearchParams({ session_key: target })
+      const data = await api<{ bindings?: ChannelBinding[] }>(`/api/contacts/bindings?${query.toString()}`)
+      setBindings(Array.isArray(data.bindings) ? data.bindings : [])
+    } catch {
+      setBindings([])
+    }
+  }
+
+  async function bindToContact(contactChatId: number): Promise<void> {
+    await api('/api/contacts/bind', {
+      method: 'POST',
+      body: JSON.stringify({ session_key: effectiveSessionKey, contact_chat_id: contactChatId }),
+    })
+    await loadBindings(effectiveSessionKey)
+    await loadSessions()
+    await loadHistory(effectiveSessionKey)
+    setRuntimeNonce((x) => x + 1)
+  }
+
+  async function unlinkContact(): Promise<void> {
+    await api('/api/contacts/unlink', {
+      method: 'POST',
+      body: JSON.stringify({ session_key: effectiveSessionKey }),
+    })
+    await loadBindings(effectiveSessionKey)
+    await loadSessions()
+  }
+
+  async function createSchedule(prompt: string, scheduleType: string, scheduleValue: string): Promise<void> {
+    await api('/api/schedules', {
+      method: 'POST',
+      body: JSON.stringify({
+        session_key: effectiveSessionKey,
+        prompt,
+        schedule_type: scheduleType,
+        schedule_value: scheduleValue,
+      }),
+    })
+    await loadSchedules(effectiveSessionKey)
+  }
+
+  async function updateScheduleStatus(taskId: number, status: string): Promise<void> {
+    await api(`/api/schedules/${taskId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status }),
+    })
+    await loadSchedules(effectiveSessionKey)
+  }
+
   useEffect(() => {
-    loadHistory(sessionKey).catch((e) => setError(e instanceof Error ? e.message : String(e)))
+    let cancelled = false
+    async function init() {
+      const chosen = await loadPersonas(effectiveSessionKey)
+      if (cancelled) return
+      loadBindings(effectiveSessionKey).catch(() => {})
+      loadSchedules(effectiveSessionKey).catch(() => {})
+      if (chosen) {
+        try {
+          await api('/api/personas/switch', {
+            method: 'POST',
+            body: JSON.stringify({ session_key: effectiveSessionKey, persona_name: chosen.name }),
+          })
+        } catch {
+          // ignore; we still load history for the chosen persona
+        }
+      }
+      loadHistory(effectiveSessionKey, chosen?.id).catch((e) => setError(e instanceof Error ? e.message : String(e)))
+    }
+    init()
+    return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionKey])
+  }, [effectiveSessionKey])
 
-  useEffect(() => {
-    writeSessionToUrl(sessionKey)
-  }, [sessionKey])
 
-  const runtimeKey = `${sessionKey}-${runtimeNonce}`
+  const runtimeKey = `${effectiveSessionKey}-${activePersonaId ?? 0}-${runtimeNonce}`
   const radixAccent = RADIX_ACCENT_BY_THEME[uiTheme] ?? 'green'
   const currentProvider = String(configDraft.llm_provider || DEFAULT_CONFIG_VALUES.llm_provider).trim().toLowerCase()
   const providerOptions = Array.from(
@@ -1148,14 +1244,13 @@ function App() {
             uiTheme={uiTheme}
             onUiThemeChange={(theme) => setUiTheme(theme as UiTheme)}
             uiThemeOptions={UI_THEME_OPTIONS}
-            sessionItems={sessionItems}
-            selectedSessionKey={sessionKey}
-            onSessionSelect={(key) => setSessionKey(key)}
-            onRefreshSession={(key) => void onRefreshSessionByKey(key)}
-            onResetSession={(key) => void onResetSessionByKey(key)}
-            onDeleteSession={(key) => void onDeleteSessionByKey(key)}
+            personas={personas}
+            selectedPersonaId={activePersonaId}
+            onPersonaSelect={(name) => void switchPersona(name)}
+            onRefreshChat={() => void onRefreshSessionByKey(effectiveSessionKey, activePersonaId)}
+            onResetChat={() => void onResetSessionByKey(effectiveSessionKey)}
+            onDeleteChat={() => void onDeleteSessionByKey(effectiveSessionKey)}
             onOpenConfig={openConfig}
-            onNewSession={createSession}
           />
 
           <main
@@ -1177,13 +1272,65 @@ function App() {
               </Heading>
             </header>
 
-            {selectedSessionReadOnly ? (
-              <Callout.Root color="amber" size="1" variant="soft" className="mx-3 mt-3">
-                <Callout.Text>
-                  This chat is read-only (linked to Telegram/Discord). Switch to a web session in the sidebar or create a new chat to send messages.
-                </Callout.Text>
-              </Callout.Root>
-            ) : null}
+            <div className="mx-3 mt-2">
+              <Button size="1" variant="soft" onClick={() => setSchedulesOpen((o) => !o)}>
+                {schedulesOpen ? 'Hide' : 'Show'} Schedules
+              </Button>
+              {schedulesOpen ? (
+                <div className="mt-2 rounded-md border p-3" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' } : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}>
+                  <Text size="2" weight="bold" className="mb-2 block">Schedules</Text>
+                  <ul className="mb-3 list-none space-y-2">
+                    {schedules.map((t) => (
+                      <li key={t.id} className="flex flex-wrap items-center gap-2 rounded border p-2" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}>
+                        <span className="min-w-0 flex-1 truncate" title={t.prompt}>{t.prompt}</span>
+                        <Text size="1" color="gray">{t.schedule_type} · {t.next_run ?? '—'}</Text>
+                        <Text size="1" color="gray">{t.status}</Text>
+                        {t.status === 'active' ? (
+                          <Button size="1" variant="soft" onClick={() => void updateScheduleStatus(t.id, 'paused')}>Pause</Button>
+                        ) : t.status === 'paused' ? (
+                          <Button size="1" variant="soft" onClick={() => void updateScheduleStatus(t.id, 'active')}>Resume</Button>
+                        ) : null}
+                        {t.status !== 'cancelled' ? (
+                          <Button size="1" variant="soft" color="red" onClick={() => void updateScheduleStatus(t.id, 'cancelled')}>Cancel</Button>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                  <Flex gap="2" align="end" wrap="wrap">
+                    <TextField.Root
+                      placeholder="Prompt"
+                      value={newSchedulePrompt}
+                      onChange={(e) => setNewSchedulePrompt(e.target.value)}
+                      className="min-w-[180px]"
+                    />
+                    <Select.Root value={newScheduleType} onValueChange={(v) => setNewScheduleType(v as 'cron' | 'once')}>
+                      <Select.Trigger className="w-[100px]" />
+                      <Select.Content>
+                        <Select.Item value="cron">Cron</Select.Item>
+                        <Select.Item value="once">Once</Select.Item>
+                      </Select.Content>
+                    </Select.Root>
+                    <TextField.Root
+                      placeholder={newScheduleType === 'cron' ? '0 9 * * *' : '2025-12-31T09:00:00Z'}
+                      value={newScheduleValue}
+                      onChange={(e) => setNewScheduleValue(e.target.value)}
+                      className="min-w-[160px]"
+                    />
+                    <Button
+                      size="1"
+                      onClick={() => {
+                        if (newSchedulePrompt.trim()) {
+                          void createSchedule(newSchedulePrompt.trim(), newScheduleType, newScheduleValue)
+                          setNewSchedulePrompt('')
+                        }
+                      }}
+                    >
+                      Add
+                    </Button>
+                  </Flex>
+                </div>
+              ) : null}
+            </div>
 
             <div
               className={

@@ -83,6 +83,13 @@ pub struct ScheduledTask {
 }
 
 #[derive(Debug, Clone)]
+pub struct ChannelBinding {
+    pub canonical_chat_id: i64,
+    pub channel_type: String,
+    pub channel_handle: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct CursorAgentRun {
     pub id: i64,
     pub chat_id: i64,
@@ -95,6 +102,8 @@ pub struct CursorAgentRun {
     pub exit_code: Option<i32>,
     pub output_preview: Option<String>,
     pub output_path: Option<String>,
+    /// When set, run was spawned in tmux (detach=true); session may still be running.
+    pub tmux_session: Option<String>,
 }
 
 impl Database {
@@ -210,11 +219,23 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_cursor_agent_runs_chat_id
                 ON cursor_agent_runs(chat_id);
             CREATE INDEX IF NOT EXISTS idx_cursor_agent_runs_finished_at
-                ON cursor_agent_runs(finished_at DESC);",
+                ON cursor_agent_runs(finished_at DESC);
+
+            CREATE TABLE IF NOT EXISTS channel_bindings (
+                canonical_chat_id INTEGER NOT NULL,
+                channel_type TEXT NOT NULL,
+                channel_handle TEXT NOT NULL,
+                PRIMARY KEY (channel_type, channel_handle),
+                FOREIGN KEY (canonical_chat_id) REFERENCES chats(chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_bindings_canonical
+                ON channel_bindings(canonical_chat_id);",
         )?;
 
         Self::migrate_persona_schema(&conn)?;
+        Self::migrate_channel_bindings(&conn)?;
         Self::migrate_fts(&conn)?;
+        Self::migrate_cursor_agent_runs_tmux(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
@@ -371,6 +392,58 @@ impl Database {
             conn.execute("INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages", [])?;
         }
 
+        Ok(())
+    }
+
+    fn migrate_cursor_agent_runs_tmux(conn: &Connection) -> Result<(), MicroClawError> {
+        let has_tmux = conn
+            .prepare("PRAGMA table_info(cursor_agent_runs)")
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                Ok(rows
+                    .filter_map(|r| r.ok())
+                    .any(|c| c == "tmux_session"))
+            })
+            .unwrap_or(false);
+        if !has_tmux {
+            conn.execute("ALTER TABLE cursor_agent_runs ADD COLUMN tmux_session TEXT", [])?;
+        }
+        Ok(())
+    }
+
+    fn migrate_channel_bindings(conn: &Connection) -> Result<(), MicroClawError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_bindings (
+                canonical_chat_id INTEGER NOT NULL,
+                channel_type TEXT NOT NULL,
+                channel_handle TEXT NOT NULL,
+                PRIMARY KEY (channel_type, channel_handle)
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_bindings_canonical
+                ON channel_bindings(canonical_chat_id);",
+        )?;
+        // Backfill: each existing chat gets one binding (canonical = chat_id)
+        let mut stmt = conn.prepare("SELECT chat_id, chat_type, chat_title FROM chats")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (chat_id, chat_type, chat_title) = row?;
+            let (ch_type, handle) = match chat_type.as_str() {
+                "telegram" => ("telegram", chat_id.to_string()),
+                "discord" => ("discord", chat_id.to_string()),
+                "web" => ("web", chat_title.unwrap_or_else(|| chat_id.to_string())),
+                _ => continue,
+            };
+            conn.execute(
+                "INSERT OR IGNORE INTO channel_bindings (canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3)",
+                params![chat_id, ch_type, handle],
+            )?;
+        }
         Ok(())
     }
 
@@ -558,6 +631,89 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    // --- Channel bindings (unified contact) ---
+
+    /// Resolve (channel_type, channel_handle) to canonical_chat_id. If no binding exists, creates one:
+    /// - telegram/discord: use handle (as i64) as canonical_chat_id, ensure chat exists, insert binding.
+    /// - web: use create_with_canonical_id as the new canonical (caller provides e.g. hash-based id), ensure chat exists, insert binding.
+    pub fn resolve_canonical_chat_id(
+        &self,
+        channel_type: &str,
+        channel_handle: &str,
+        create_with_canonical_id: Option<i64>,
+    ) -> Result<i64, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(canonical) = conn
+            .query_row(
+                "SELECT canonical_chat_id FROM channel_bindings WHERE channel_type = ?1 AND channel_handle = ?2",
+                params![channel_type, channel_handle],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+        {
+            return Ok(canonical);
+        }
+        let canonical = match channel_type {
+            "telegram" | "discord" => channel_handle
+                .parse::<i64>()
+                .map_err(|_| MicroClawError::ToolExecution(format!("invalid handle for {}: {}", channel_type, channel_handle)))?,
+            "web" => create_with_canonical_id
+                .ok_or_else(|| MicroClawError::ToolExecution("web resolve requires create_with_canonical_id".into()))?,
+            _ => return Err(MicroClawError::ToolExecution(format!("unknown channel_type: {}", channel_type))),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO chats (chat_id, chat_title, chat_type, last_message_time) VALUES (?1, NULL, ?2, ?3)",
+            params![canonical, channel_type, now],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_bindings (canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3)",
+            params![canonical, channel_type, channel_handle],
+        )?;
+        Ok(canonical)
+    }
+
+    /// Add a binding from (channel_type, channel_handle) to canonical_chat_id. If that (type, handle) already exists, updates to this contact.
+    pub fn link_channel(
+        &self,
+        canonical_chat_id: i64,
+        channel_type: &str,
+        channel_handle: &str,
+    ) -> Result<(), MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_bindings (canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3)",
+            params![canonical_chat_id, channel_type, channel_handle],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the binding for (channel_type, channel_handle).
+    pub fn unlink_channel(&self, channel_type: &str, channel_handle: &str) -> Result<bool, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM channel_bindings WHERE channel_type = ?1 AND channel_handle = ?2",
+            params![channel_type, channel_handle],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// List all channel bindings for this contact (canonical_chat_id).
+    pub fn list_bindings_for_contact(&self, canonical_chat_id: i64) -> Result<Vec<ChannelBinding>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT canonical_chat_id, channel_type, channel_handle FROM channel_bindings WHERE canonical_chat_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![canonical_chat_id], |row| {
+            Ok(ChannelBinding {
+                canonical_chat_id: row.get(0)?,
+                channel_type: row.get(1)?,
+                channel_handle: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Get messages since the bot's last response in this chat/persona.
@@ -892,11 +1048,12 @@ impl Database {
         exit_code: Option<i32>,
         output_preview: Option<&str>,
         output_path: Option<&str>,
+        tmux_session: Option<&str>,
     ) -> Result<i64, MicroClawError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO cursor_agent_runs (chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO cursor_agent_runs (chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path, tmux_session)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 chat_id,
                 channel,
@@ -908,6 +1065,7 @@ impl Database {
                 exit_code,
                 output_preview,
                 output_path,
+                tmux_session,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -923,7 +1081,7 @@ impl Database {
         let runs: Vec<CursorAgentRun> = match chat_id {
             Some(cid) => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path
+                    "SELECT id, chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path, tmux_session
                      FROM cursor_agent_runs WHERE chat_id = ?1 ORDER BY finished_at DESC LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![cid, limit as i64], |row| {
@@ -939,13 +1097,14 @@ impl Database {
                         exit_code: row.get(8)?,
                         output_preview: row.get(9)?,
                         output_path: row.get(10)?,
+                        tmux_session: row.get(11)?,
                     })
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()?
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path
+                    "SELECT id, chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path, tmux_session
                      FROM cursor_agent_runs ORDER BY finished_at DESC LIMIT ?1",
                 )?;
                 let rows = stmt.query_map(params![limit as i64], |row| {
@@ -961,6 +1120,7 @@ impl Database {
                         exit_code: row.get(8)?,
                         output_preview: row.get(9)?,
                         output_path: row.get(10)?,
+                        tmux_session: row.get(11)?,
                     })
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()?
@@ -1044,6 +1204,7 @@ impl Database {
             "DELETE FROM social_oauth_tokens WHERE chat_id = ?1",
             params![chat_id],
         )?;
+        affected += tx.execute("DELETE FROM channel_bindings WHERE canonical_chat_id = ?1", params![chat_id])?;
         affected += tx.execute("DELETE FROM chats WHERE chat_id = ?1", params![chat_id])?;
 
         tx.commit()?;

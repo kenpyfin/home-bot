@@ -41,7 +41,8 @@ fn format_tasks_list_impl(tasks: &[ScheduledTask], include_chat_id: bool) -> Str
     output
 }
 
-fn compute_next_run(cron_expr: &str, tz_name: &str) -> Result<String, String> {
+/// Compute next run time for a cron expression (used by schedule_task and web API).
+pub(crate) fn compute_next_run(cron_expr: &str, tz_name: &str) -> Result<String, String> {
     let tz: chrono_tz::Tz = tz_name
         .parse()
         .map_err(|_| format!("Invalid timezone: {tz_name}"))?;
